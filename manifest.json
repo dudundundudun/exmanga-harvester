@@ -1,0 +1,54 @@
+{
+  "manifest_version": 3,
+  "name": "ExManga Harvester Studio (v1.8)",
+  "short_name": "ExManga Harvester",
+  "version": "1.8.0",
+  "description": "Автосохранение манги с ExHentai / E-Hentai напрямую в одноимённую папку (без 500 окон «Сохранить как») или в единый ZIP/CBZ архив с кнопкой открытия папки.",
+  "permissions": [
+    "downloads",
+    "storage",
+    "activeTab",
+    "scripting"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "ExManga Harvester Studio",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://exhentai.org/g/*",
+        "*://exhentai.org/s/*",
+        "*://*.exhentai.org/g/*",
+        "*://*.exhentai.org/s/*",
+        "*://e-hentai.org/g/*",
+        "*://e-hentai.org/s/*",
+        "*://*.e-hentai.org/g/*",
+        "*://*.e-hentai.org/s/*"
+      ],
+      "css": [
+        "styles.css"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}
