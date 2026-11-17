@@ -2,10 +2,10 @@
 <html lang="ru">
 <head>
   <meta charset="UTF-8" />
-  <title>ExManga Harvester Studio</title>
+  <title>ExManga Harvester Studio v1.9</title>
   <style>
     body {
-      width: 355px;
+      width: 365px;
       margin: 0;
       padding: 14px;
       background: #181a20;
@@ -39,6 +39,20 @@
       font-size: 11px;
       color: #9aa0a6;
     }
+    .perm-banner {
+      display: none;
+      margin-top: 8px;
+      padding: 7px 9px;
+      border-radius: 6px;
+      background: rgba(251, 188, 4, 0.14);
+      border: 1px solid rgba(251, 188, 4, 0.45);
+      color: #fde293;
+      font-size: 11px;
+      line-height: 1.35;
+    }
+    .perm-banner.visible {
+      display: block;
+    }
     .row {
       display: flex;
       align-items: center;
@@ -65,6 +79,12 @@
     input[type="number"] {
       width: 64px;
       text-align: center;
+    }
+    input[type="checkbox"] {
+      accent-color: #3186ff;
+      width: 15px;
+      height: 15px;
+      cursor: pointer;
     }
     .btn-row {
       display: flex;
@@ -114,18 +134,20 @@
       color: #9aa0a6;
       display: flex;
       justify-content: space-between;
+      gap: 8px;
     }
   </style>
 </head>
 <body>
   <h2>
     <span>ExManga Harvester</span>
-    <span style="font-size:11px;color:#9aa0a6;font-weight:400;">v1.8</span>
+    <span style="font-size:11px;color:#9aa0a6;font-weight:400;">v1.9</span>
   </h2>
 
   <div class="card" id="tab-info">
     <div class="meta-title" id="gallery-title">Откройте страницу галереи или читалки</div>
     <div class="meta-sub" id="gallery-sub">Расширение активируется на страницах /g/* и /s/*</div>
+    <div class="perm-banner" id="perm-banner"></div>
   </div>
 
   <div class="card">
@@ -174,6 +196,14 @@
     <div class="row">
       <label>Повторы зеркала (nl):</label>
       <input type="number" id="max-retries" min="0" max="10" value="3" />
+    </div>
+    <div class="row">
+      <label for="smart-resume">Умная докачка (пропуск готовых):</label>
+      <input type="checkbox" id="smart-resume" checked />
+    </div>
+    <div class="row">
+      <label for="include-comicinfo">Добавлять ComicInfo.xml:</label>
+      <input type="checkbox" id="include-comicinfo" checked />
     </div>
   </div>
 

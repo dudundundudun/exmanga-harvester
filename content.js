@@ -1,6 +1,63 @@
 (() => {
-  if (window.__EXMANGA_HARVESTER_V18__) return;
-  window.__EXMANGA_HARVESTER_V18__ = true;
+  // Если в этой вкладке уже работал старый экземпляр скрипта (например, до перезагрузки расширения
+  // на chrome://extensions), посылаем ему сигнал корректного завершения и перехватываем панель.
+  window.dispatchEvent(new CustomEvent("mhs:teardown-previous-instance"));
+
+  let instanceAborted = false;
+
+  // === Проверка валидности контекста расширения (защита от "Extension context invalidated") ===
+  function isExtensionContextValid() {
+    try {
+      return Boolean(typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.id);
+    } catch {
+      return false;
+    }
+  }
+
+  async function safeStorageGet(keys) {
+    if (!isExtensionContextValid()) {
+      throw new Error(
+        "Контекст расширения обновился (перезагрузка в chrome://extensions). Нажмите F5 на странице."
+      );
+    }
+    try {
+      return await chrome.storage.local.get(keys);
+    } catch (err) {
+      if (String(err?.message || err).includes("Extension context invalidated")) {
+        throw new Error(
+          "Контекст расширения обновился (перезагрузка в chrome://extensions). Нажмите F5 на странице."
+        );
+      }
+      throw err;
+    }
+  }
+
+  async function safeStorageSet(obj) {
+    if (!isExtensionContextValid()) return;
+    try {
+      await chrome.storage.local.set(obj);
+    } catch {
+      // ignore if context invalidated during save
+    }
+  }
+
+  async function safeRuntimeMessage(payload) {
+    if (!isExtensionContextValid()) {
+      throw new Error(
+        "Контекст расширения обновился (перезагрузка в chrome://extensions). Нажмите F5 на странице."
+      );
+    }
+    try {
+      return await chrome.runtime.sendMessage(payload);
+    } catch (err) {
+      if (String(err?.message || err).includes("Extension context invalidated")) {
+        throw new Error(
+          "Контекст расширения обновился (перезагрузка в chrome://extensions). Нажмите F5 на странице."
+        );
+      }
+      throw err;
+    }
+  }
 
   // === Хранение выбранной базовой папки (FileSystemDirectoryHandle) в IndexedDB ===
   const IDB_NAME = "ExMangaHarvesterFS";
@@ -49,6 +106,18 @@
     }
   }
 
+  // Проверка статуса прав на папку БЕЗ вызова диалога (безопасно вызывать без User Gesture из Popup)
+  async function querySavedDirPermissionStatus() {
+    const existing = await getSavedRootDirHandle();
+    if (!existing) return { state: "missing", name: "" };
+    try {
+      const perm = await existing.queryPermission({ mode: "readwrite" });
+      return { state: perm, name: existing.name || "Выбранная папка", handle: existing };
+    } catch {
+      return { state: "missing", name: "" };
+    }
+  }
+
   async function ensureBaseDirectoryHandle(forceNewPicker = false) {
     if (typeof window.showDirectoryPicker !== "function") {
       throw new Error("Браузер не поддерживает прямой доступ к папкам (File System Access API)");
@@ -65,19 +134,28 @@
           if (perm === "granted") {
             return existing;
           }
-        } catch {
-          // Если старый дескриптор устарел — откроем выбор папки заново
+        } catch (err) {
+          if (err && err.name === "SecurityError") {
+            throw new Error("NEED_USER_GESTURE_ON_PAGE");
+          }
         }
       }
     }
 
-    const picked = await window.showDirectoryPicker({
-      id: "exmanga_root_dir",
-      mode: "readwrite",
-      startIn: "downloads"
-    });
-    await saveRootDirHandle(picked);
-    return picked;
+    try {
+      const picked = await window.showDirectoryPicker({
+        id: "exmanga_root_dir",
+        mode: "readwrite",
+        startIn: "downloads"
+      });
+      await saveRootDirHandle(picked);
+      return picked;
+    } catch (err) {
+      if (err && err.name === "SecurityError") {
+        throw new Error("NEED_USER_GESTURE_ON_PAGE");
+      }
+      throw err;
+    }
   }
 
   async function getOrCreateSubfolderHandle(rootHandle, relativeFolderPath) {
@@ -92,6 +170,30 @@
       current = await current.getDirectoryHandle(part, { create: true });
     }
     return current;
+  }
+
+  // Сканирование уже существующих файлов в папке манги для Smart Resume
+  async function scanExistingPagePrefixes(dirHandle) {
+    const existingByPage = new Map();
+    if (!dirHandle || typeof dirHandle.entries !== "function") return existingByPage;
+    try {
+      for await (const [name, entry] of dirHandle.entries()) {
+        if (entry.kind !== "file") continue;
+        const m = name.match(/^0*(\d+)(?:_|\.)/i);
+        if (!m) continue;
+        try {
+          const file = await entry.getFile();
+          if (file && file.size >= 128) {
+            existingByPage.set(Number(m[1]), name);
+          }
+        } catch {
+          // ignore unreadable file
+        }
+      }
+    } catch {
+      // ignore directory enumeration issues
+    }
+    return existingByPage;
   }
 
   // === Встроенный упаковщик PKZIP (STORE = 0 + CRC32 + DOS timestamps + UTF-8) ===
@@ -133,7 +235,7 @@
 
     for (const file of files) {
       const nameBytes = encoder.encode(file.name);
-      const data = file.data;
+      const data = file.data instanceof Uint8Array ? file.data : encoder.encode(String(file.data));
       const crc = crc32(data);
 
       const lfh = new Uint8Array(30 + nameBytes.length);
@@ -183,6 +285,47 @@
     return new Blob([...localParts, ...centralParts, eocd], { type: mimeType });
   }
 
+  function escapeXml(str) {
+    return String(str || "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&apos;");
+  }
+
+  function buildComicInfoXml(meta) {
+    const tags = meta.tags || {};
+    const writer = [...(tags.artist || []), ...(tags.group || [])].join(", ");
+    const series = (tags.parody || []).join(", ") || meta.title;
+    const characters = (tags.character || []).join(", ");
+    const genre = [...(tags.female || []), ...(tags.male || []), ...(tags.misc || [])].join(", ");
+    const langList = tags.language || [];
+    let langIso = "ja";
+    if (langList.includes("russian")) langIso = "ru";
+    else if (langList.includes("english")) langIso = "en";
+    else if (langList.includes("chinese")) langIso = "zh";
+
+    const lines = [
+      '<?xml version="1.0" encoding="utf-8"?>',
+      '<ComicInfo xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">',
+      `  <Title>${escapeXml(meta.rawTitle || meta.title)}</Title>`,
+      `  <Series>${escapeXml(series)}</Series>`,
+      meta.jpTitle ? `  <AlternateSeries>${escapeXml(meta.jpTitle)}</AlternateSeries>` : null,
+      writer ? `  <Writer>${escapeXml(writer)}</Writer>` : null,
+      characters ? `  <Characters>${escapeXml(characters)}</Characters>` : null,
+      genre ? `  <Genre>${escapeXml(genre)}</Genre>` : null,
+      `  <PageCount>${Number(meta.totalPages || 0)}</PageCount>`,
+      `  <LanguageISO>${escapeXml(langIso)}</LanguageISO>`,
+      `  <Manga>YesAndRightToLeft</Manga>`,
+      `  <Web>${escapeXml(meta.galleryUrl || window.location.href)}</Web>`,
+      `  <Notes>Downloaded with ExManga Harvester Studio v1.9 (GID: ${meta.gid})</Notes>`,
+      "</ComicInfo>"
+    ].filter(Boolean);
+
+    return new TextEncoder().encode(lines.join("\n"));
+  }
+
   function sanitizeName(str, maxLen = 95) {
     let clean = (str || "Manga")
       .replace(/[\\/:*?"<>|~\x00-\x1f]/g, "_")
@@ -228,7 +371,8 @@
     meta: null,
     rootDirHandle: null,
     lastMangaDirHandle: null,
-    lastSaveMode: "folder"
+    lastSaveMode: "folder",
+    folderPermission: "missing"
   };
 
   function parseInlineScripts(doc = document) {
@@ -238,8 +382,81 @@
     const showkey = (text.match(/\bshowkey\s*=\s*["']([^"']+)["']/) || [])[1] || "";
     const startpage = Number((text.match(/\bstartpage\s*=\s*(\d+)/) || [])[1] || 0);
     const startkey = (text.match(/\bstartkey\s*=\s*["']([^"']+)["']/) || [])[1] || "";
-    const apiUrl = (text.match(/\bapi_url\s*=\s*["']([^"']+)["']/) || [])[1] || `${window.location.origin}/api.php`;
+    const apiUrl =
+      (text.match(/\bapi_url\s*=\s*["']([^"']+)["']/) || [])[1] ||
+      `${window.location.origin}/api.php`;
     return { gid, token, showkey, startpage, startkey, apiUrl };
+  }
+
+  function parseGalleryTags(doc = document) {
+    const tags = {};
+    const rows = doc.querySelectorAll("#taglist tr");
+    for (const tr of rows) {
+      const catCell = tr.querySelector("td.tc");
+      if (!catCell) continue;
+      const cat = catCell.textContent.replace(/:/g, "").trim().toLowerCase();
+      const values = Array.from(tr.querySelectorAll("td div a")).map((a) =>
+        a.textContent.trim()
+      );
+      if (cat && values.length > 0) {
+        tags[cat] = values;
+      }
+    }
+    return tags;
+  }
+
+  function computeGalleryPagination(doc = document, currentUrl = window.location.href) {
+    const gpcText = doc.querySelector(".gpc")?.textContent || "";
+    let totalPages = 0;
+    let perPage = 0;
+
+    // Формат: "Showing 1 - 40 of 125 images" или "Showing 41 - 45 of 45 images"
+    const rangeMatch = gpcText.match(/Showing\s+([\d,]+)\s*-\s*([\d,]+)\s+of\s+([\d,]+)\s+images/i);
+    if (rangeMatch) {
+      const startIdx = Number(rangeMatch[1].replace(/,/g, ""));
+      const endIdx = Number(rangeMatch[2].replace(/,/g, ""));
+      totalPages = Number(rangeMatch[3].replace(/,/g, ""));
+
+      let currentP = 0;
+      try {
+        currentP = Number(new URL(currentUrl, window.location.origin).searchParams.get("p") || 0);
+      } catch {
+        currentP = 0;
+      }
+
+      if (currentP > 0 && startIdx > 1) {
+        // Если мы на ?p=1 или ?p=2 (даже если это неполный последний лист), точный размер полного листа = (startIdx - 1) / currentP
+        perPage = Math.round((startIdx - 1) / currentP);
+      } else {
+        perPage = endIdx - startIdx + 1;
+      }
+    } else {
+      const gpcMatch = gpcText.match(/of\s+([\d,]+)\s+images/i);
+      if (gpcMatch) {
+        totalPages = Number(gpcMatch[1].replace(/,/g, ""));
+      }
+    }
+
+    if (!totalPages) {
+      const gddCells = Array.from(doc.querySelectorAll("#gdd td.gdt2"));
+      for (const td of gddCells) {
+        const m = (td.textContent || "").match(/^([\d,]+)\s+pages/i);
+        if (m) {
+          totalPages = Number(m[1].replace(/,/g, ""));
+          break;
+        }
+      }
+    }
+
+    const thumbsCount = doc.querySelectorAll("#gdt a[href*='/s/']").length;
+    if (!perPage) {
+      perPage = thumbsCount || 20;
+    }
+
+    return {
+      totalPages: totalPages || thumbsCount || 1,
+      perPage: perPage || 20
+    };
   }
 
   function detectPageMetadata() {
@@ -251,59 +468,52 @@
       const gid = vars.gid || (urlMatch ? Number(urlMatch[1]) : 0);
       const token = vars.token || (urlMatch ? urlMatch[2] : "");
 
-      const title =
+      const rawTitle =
         document.querySelector("#gn")?.textContent?.trim() ||
         document.querySelector("#gj")?.textContent?.trim() ||
         document.title.replace(/\s*-\s*(ExHentai\.org|E-Hentai Galleries).*$/i, "");
+      const jpTitle = document.querySelector("#gj")?.textContent?.trim() || "";
 
-      let totalPages = 0;
-      const gpcText = document.querySelector(".gpc")?.textContent || "";
-      const gpcMatch = gpcText.match(/of\s+([\d,]+)\s+images/i);
-      if (gpcMatch) {
-        totalPages = Number(gpcMatch[1].replace(/,/g, ""));
-      }
-      if (!totalPages) {
-        const gddCells = Array.from(document.querySelectorAll("#gdd td.gdt2"));
-        for (const td of gddCells) {
-          const m = (td.textContent || "").match(/^([\d,]+)\s+pages/i);
-          if (m) {
-            totalPages = Number(m[1].replace(/,/g, ""));
-            break;
-          }
-        }
-      }
-
-      const thumbs = Array.from(document.querySelectorAll("#gdt a[href*='/s/']"));
-      const perPage = thumbs.length || 20;
+      const { totalPages, perPage } = computeGalleryPagination(document, url);
+      const tags = parseGalleryTags(document);
 
       return {
         mode: "gallery",
         gid,
         token,
         apiUrl: vars.apiUrl,
-        title: sanitizeName(title),
-        totalPages: totalPages || thumbs.length || 1,
+        rawTitle,
+        jpTitle,
+        tags,
+        galleryUrl: `${window.location.origin}/g/${gid}/${token}/`,
+        title: sanitizeName(rawTitle),
+        totalPages,
         startPage: 1,
         perPage
       };
     } else {
-      const urlMatch = url.match(/\/s\/([a-f0-9]+)\/(\d+)-(\d+)/i);
-      const startkey = vars.startkey || (urlMatch ? urlMatch[1] : "");
-      const gid = vars.gid || (urlMatch ? Number(urlMatch[2]) : 0);
-      const urlPage = urlMatch ? Number(urlMatch[3]) : 1;
+      // В режиме читалки (/s/...) приоритет у живого URL и DOM (.sn div span),
+      // так как при перелистывании по AJAX inline-скрипт в <head> остаётся старым.
+      const urlMatch = window.location.pathname.match(/\/s\/([a-f0-9]+)\/(\d+)-(\d+)/i);
+      const startkey = (urlMatch ? urlMatch[1] : "") || vars.startkey || "";
+      const gid = (urlMatch ? Number(urlMatch[2]) : 0) || vars.gid || 0;
+      const urlPage = urlMatch ? Number(urlMatch[3]) : 0;
 
       const backHref = document.querySelector("#i5 a")?.getAttribute("href") || "";
       const backMatch = backHref.match(/\/g\/(\d+)\/([a-f0-9]+)/i);
       const token = vars.token || (backMatch ? backMatch[2] : "");
 
-      const title =
+      const rawTitle =
         document.querySelector("#i1 h1")?.textContent?.trim() ||
         document.querySelector("h1")?.textContent?.trim() ||
         document.title.replace(/\s*-\s*(ExHentai\.org|E-Hentai Galleries).*$/i, "");
 
       const snSpans = document.querySelectorAll(".sn div span");
-      const currentPage = vars.startpage || Number(snSpans[0]?.textContent || urlPage || 1);
-      const totalPages = Number(snSpans[1]?.textContent || currentPage || 1);
+      const domCurrentPage = Number(snSpans[0]?.textContent || 0);
+      const domTotalPages = Number(snSpans[1]?.textContent || 0);
+
+      const currentPage = domCurrentPage || urlPage || vars.startpage || 1;
+      const totalPages = domTotalPages || currentPage || 1;
 
       return {
         mode: "reader",
@@ -312,12 +522,21 @@
         showkey: vars.showkey,
         startkey,
         apiUrl: vars.apiUrl,
-        title: sanitizeName(title),
+        rawTitle,
+        jpTitle: "",
+        tags: {},
+        galleryUrl: token ? `${window.location.origin}/g/${gid}/${token}/` : window.location.href,
+        title: sanitizeName(rawTitle),
         totalPages,
         startPage: currentPage,
         perPage: 0
       };
     }
+  }
+
+  function decodeHtmlEntities(str) {
+    if (!str) return "";
+    return str.replace(/&amp;/g, "&");
   }
 
   function parseReaderFragments(i3Html, i6Html, i7Html = "", nHtml = "") {
@@ -327,7 +546,7 @@
     const srcMatch =
       (i3Html || "").match(/id=["']img["'][^>]*src=["']([^"']+)["']/i) ||
       (i3Html || "").match(/src=["']([^"']+)["'][^>]*id=["']img["']/i);
-    const imgUrl = srcMatch ? srcMatch[1].replace(/&amp;/g, "&") : "";
+    const imgUrl = srcMatch ? decodeHtmlEntities(srcMatch[1]) : "";
 
     let nextMatch = (i3Html || "").match(/load_image\(\s*(\d+)\s*,\s*['"]([a-f0-9]+)['"]\s*\)/i);
     if (!nextMatch && nHtml) {
@@ -345,7 +564,14 @@
     const nlToken = nlMatch ? nlMatch[1] : null;
 
     const fullMatch = combinedBottom.match(/href=["']([^"']*fullimg[^"']+)["']/i);
-    const fullImgUrl = fullMatch ? fullMatch[1].replace(/&amp;/g, "&") : "";
+    let fullImgUrl = fullMatch ? decodeHtmlEntities(fullMatch[1]) : "";
+    if (fullImgUrl && !/^https?:\/\//i.test(fullImgUrl)) {
+      try {
+        fullImgUrl = new URL(fullImgUrl, window.location.origin).href;
+      } catch {
+        // ignore
+      }
+    }
 
     return { imgUrl, fullImgUrl, nextPage, nextImgKey, nlToken };
   }
@@ -391,7 +617,7 @@
 
   async function resolveReaderUrlForPage(targetPage, meta) {
     if (isReaderPage) {
-      const m = window.location.href.match(/\/s\/([a-f0-9]+)\/(\d+)-(\d+)/i);
+      const m = window.location.pathname.match(/\/s\/([a-f0-9]+)\/(\d+)-(\d+)/i);
       if (m && Number(m[3]) === targetPage) {
         return window.location.href.split("?")[0];
       }
@@ -423,11 +649,19 @@
       if (!p0Res.ok) throw new Error(`Не удалось загрузить галерею ?p=0 (HTTP ${p0Res.status})`);
       const p0Html = await p0Res.text();
       const p0Doc = new DOMParser().parseFromString(p0Html, "text/html");
+
+      if (!meta.jpTitle) {
+        meta.jpTitle = p0Doc.querySelector("#gj")?.textContent?.trim() || "";
+      }
+      if (!meta.tags || Object.keys(meta.tags).length === 0) {
+        meta.tags = parseGalleryTags(p0Doc);
+      }
+
       const foundOnP0 = findReaderLinkInGalleryDoc(p0Doc, meta.gid, targetPage);
       if (foundOnP0) return foundOnP0;
 
-      const thumbsCount = p0Doc.querySelectorAll("#gdt a[href*='/s/']").length;
-      perPage = thumbsCount || 20;
+      const pagination = computeGalleryPagination(p0Doc, p0Url);
+      perPage = pagination.perPage || 20;
       meta.perPage = perPage;
     }
 
@@ -489,30 +723,44 @@
   }) {
     let info = { ...currentInfo };
     const maxRetries = Math.max(0, Number(settings.maxRetries ?? 3));
+    let forceCompressedFallback = false;
 
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
-      const useOriginal = Boolean(settings.quality === "original" && info.fullImgUrl);
+      const useOriginal = Boolean(
+        !forceCompressedFallback && settings.quality === "original" && info.fullImgUrl
+      );
       const targetUrl = useOriginal ? info.fullImgUrl : info.imgUrl;
 
       if (!targetUrl) {
         throw new Error(`Не найден URL изображения на странице ${pageNumber}`);
       }
 
-      const resp = await chrome.runtime.sendMessage({
+      const resp = await safeRuntimeMessage({
         action: "fetchImageBytes",
         url: targetUrl,
         includeCredentials: useOriginal
       });
 
       if (resp && resp.ok && resp.base64) {
-        return { resp, usedUrl: resp.finalUrl || targetUrl, info };
+        return { resp, usedUrl: resp.finalUrl || targetUrl, info, usedFallback: forceCompressedFallback };
+      }
+
+      // Если мы пытались скачать оригинал (fullimg), но сервер вернул лимит GP/509 или ошибку,
+      // переключение ?nl= не меняет ссылку fullimg.php — делаем умный фоллбэк на ридер-версию!
+      if (useOriginal && info.imgUrl && settings.fallbackOriginal !== false) {
+        updateStatus(
+          `Оригинал стр. ${pageNumber} недоступен (${resp?.error || "лимит"}). Авто-переход на сжатую копию...`
+        );
+        forceCompressedFallback = true;
+        attempt--; // не тратим попытку зеркала на сам фоллбэк
+        continue;
       }
 
       if (attempt < maxRetries && info.nlToken && imgKey) {
         updateStatus(
           `Сбой узла на стр. ${pageNumber} (${resp?.error || "ошибка"}). Смена зеркала nl (${attempt + 1}/${maxRetries})...`
         );
-        await sleep(1000);
+        await sleep(900 + Math.floor(Math.random() * 300));
         const fallbackReaderUrl = `${window.location.origin}/s/${imgKey}/${gid}-${pageNumber}?nl=${encodeURIComponent(info.nlToken)}`;
         const nlRes = await fetch(fallbackReaderUrl, { credentials: "include" });
         if (nlRes.ok) {
@@ -532,7 +780,7 @@
         }
       } else if (attempt < maxRetries) {
         updateStatus(`Повтор скачивания стр. ${pageNumber} (${attempt + 1}/${maxRetries})...`);
-        await sleep(1000);
+        await sleep(900 + Math.floor(Math.random() * 300));
       } else {
         throw new Error(`Сбой скачивания страницы ${pageNumber}: ${resp?.error || "нет ответа"}`);
       }
@@ -540,14 +788,55 @@
   }
 
   async function waitWhilePaused() {
-    while (state.paused && !state.cancelled) {
+    while (state.paused && !state.cancelled && !instanceAborted) {
       await sleep(250);
     }
   }
 
+  // Сохранение собранного архива (.CBZ / .ZIP) на диск (в базовую папку при наличии прав или через браузер)
+  async function saveArchiveToDisk(collectedFiles, meta, settings, archiveFileName) {
+    const isCbz = settings.saveMode === "cbz";
+    const filesToPack = [...collectedFiles];
+    if (settings.includeComicInfo !== false) {
+      filesToPack.push({
+        name: "ComicInfo.xml",
+        data: buildComicInfoXml(meta)
+      });
+    }
+
+    const zipBlob = buildZipBlob(
+      filesToPack,
+      isCbz ? "application/vnd.comicbook+zip" : "application/zip"
+    );
+
+    // Если у пользователя уже выданы права на базовую папку в текущей вкладке — можем также сохранить
+    // или скачать через штатный менеджер загрузок Chrome с фиксацией downloadId для кнопки «Открыть папку»
+    const blobUrl = URL.createObjectURL(zipBlob);
+    try {
+      const dlResp = await safeRuntimeMessage({
+        action: "downloadArchiveBlobUrl",
+        blobUrl,
+        filename: archiveFileName
+      });
+      if (dlResp && dlResp.ok) {
+        setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
+        return;
+      }
+    } catch {
+      // Fallback на <a download> если Service Worker недоступен
+    }
+
+    const a = document.createElement("a");
+    a.href = blobUrl;
+    a.download = archiveFileName;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
+  }
+
   // Открытие папки со скачанной мангой
   async function handleOpenDownloadedFolder(shiftKey = false) {
-    // Если зажат Shift (или базовая папка выбрана вне Загрузок и пользователь хочет открыть именно подпапку манги через диалог)
     if (shiftKey && (state.lastMangaDirHandle || state.rootDirHandle)) {
       try {
         await window.showDirectoryPicker({
@@ -561,10 +850,24 @@
     }
 
     const preferShowLastFile = state.lastSaveMode === "cbz" || state.lastSaveMode === "zip";
-    await chrome.runtime.sendMessage({
-      action: "openDownloadsFolder",
-      preferShowLastFile
-    });
+    try {
+      await safeRuntimeMessage({
+        action: "openDownloadsFolder",
+        preferShowLastFile
+      });
+    } catch (err) {
+      syncUI(err.message || String(err));
+    }
+  }
+
+  function highlightPickDirButton(message) {
+    syncUI(message);
+    if (!uiEls || !uiEls.pickDirBtn) return;
+    uiEls.pickDirBtn.scrollIntoView({ behavior: "smooth", block: "center" });
+    uiEls.pickDirBtn.classList.add("mhs-btn-pulse");
+    setTimeout(() => {
+      uiEls?.pickDirBtn?.classList.remove("mhs-btn-pulse");
+    }, 4500);
   }
 
   async function startHarvest(customOptions = {}, preAcquiredRootDirHandle = null) {
@@ -572,7 +875,14 @@
     const meta = detectPageMetadata();
     state.meta = meta;
 
-    const stored = await chrome.storage.local.get(["harvesterSettings"]);
+    let stored = {};
+    try {
+      stored = await safeStorageGet(["harvesterSettings"]);
+    } catch (err) {
+      syncUI(`Остановлено: ${err.message || String(err)}`);
+      return;
+    }
+
     const settings = {
       saveMode: "folder",
       quality: "webp",
@@ -580,6 +890,9 @@
       maxRetries: 3,
       folderTemplate: "{title}",
       fileTemplate: "{page_pad}_{orig_name}",
+      smartResume: true,
+      includeComicInfo: true,
+      fallbackOriginal: true,
       ...(stored.harvesterSettings || {}),
       ...customOptions
     };
@@ -589,36 +902,53 @@
     }
     state.lastSaveMode = settings.saveMode;
 
-    await chrome.storage.local.set({
+    await safeStorageSet({
       harvesterSettings: {
         saveMode: settings.saveMode,
         quality: settings.quality,
         delayMs: settings.delayMs,
         maxRetries: settings.maxRetries,
         folderTemplate: settings.folderTemplate,
-        fileTemplate: settings.fileTemplate
+        fileTemplate: settings.fileTemplate,
+        smartResume: settings.smartResume,
+        includeComicInfo: settings.includeComicInfo,
+        fallbackOriginal: settings.fallbackOriginal
       }
     });
 
     const startPage = Math.max(1, Math.min(meta.totalPages, Number(settings.startPage || 1)));
-    const endPage = Math.max(startPage, Math.min(meta.totalPages, Number(settings.endPage || meta.totalPages)));
+    const endPage = Math.max(
+      startPage,
+      Math.min(meta.totalPages, Number(settings.endPage || meta.totalPages))
+    );
     const totalToDownload = endPage - startPage + 1;
     const folderName = buildFolderPath(settings.folderTemplate || "{title}", meta.gid, meta.title);
 
     let targetMangaDirHandle = null;
     let rootDirName = "";
+    let existingPagesMap = new Map();
+
     if (settings.saveMode === "folder") {
       try {
         const rootHandle = preAcquiredRootDirHandle || (await ensureBaseDirectoryHandle(false));
         state.rootDirHandle = rootHandle;
+        state.folderPermission = "granted";
         rootDirName = rootHandle.name || "Выбранная папка";
-        updateFolderBtnLabel(rootDirName);
+        updateFolderBtnLabel(rootDirName, "granted");
         targetMangaDirHandle = await getOrCreateSubfolderHandle(rootHandle, folderName);
         state.lastMangaDirHandle = targetMangaDirHandle;
+
+        if (settings.smartResume !== false) {
+          existingPagesMap = await scanExistingPagePrefixes(targetMangaDirHandle);
+        }
       } catch (err) {
-        syncUI(
-          "Чтобы скачать в папку без 500 окон Проводника, нажмите кнопку «Скачать» прямо на панели страницы и выберите базовую папку 1 раз."
-        );
+        if (err && err.message === "NEED_USER_GESTURE_ON_PAGE") {
+          highlightPickDirButton(
+            "Браузер требует 1 клик на самой странице для доступа к папке — нажмите подсвеченную кнопку «📁 Куда» или «Скачать» на панели страницы."
+          );
+        } else {
+          syncUI("Выбор папки отменён пользователем.");
+        }
         return;
       }
     }
@@ -630,48 +960,66 @@
     state.total = totalToDownload;
     syncUI("Инициализация стартовой страницы...");
 
+    const collectedFiles = [];
+    let lastCompletedPage = startPage - 1;
+    let skippedCount = 0;
+
     try {
       let gid = meta.gid;
       let apiUrl = meta.apiUrl;
       let showkey = meta.showkey;
       let currentImgKey = meta.startkey;
       let currentInfo = null;
-
-      if (isGalleryPage || startPage !== meta.startPage || !showkey) {
-        syncUI(`Получение ключей стартовой страницы #${startPage}...`);
-        const readerUrl = await resolveReaderUrlForPage(startPage, meta);
-        const keyMatch = readerUrl.match(/\/s\/([a-f0-9]+)\/(\d+)-(\d+)/i);
-        if (keyMatch) currentImgKey = keyMatch[1];
-
-        const firstRes = await fetch(readerUrl, { credentials: "include" });
-        if (!firstRes.ok) throw new Error(`Ошибка загрузки страницы ридера #${startPage}`);
-        const firstHtml = await firstRes.text();
-        const parsedFirst = parseFullReaderDocument(firstHtml);
-        gid = parsedFirst.gid || gid;
-        showkey = parsedFirst.showkey || showkey;
-        apiUrl = parsedFirst.apiUrl || apiUrl;
-        currentInfo = parsedFirst;
-      } else {
-        const i3Html = document.querySelector("#i3")?.innerHTML || "";
-        const i6Html = document.querySelector("#i6")?.innerHTML || "";
-        const i7Html = document.querySelector("#i7")?.innerHTML || "";
-        const i2Html = document.querySelector("#i2")?.innerHTML || "";
-        currentInfo = parseReaderFragments(i3Html, i6Html, i7Html, i2Html);
-      }
-
-      if (!showkey && startPage < endPage) {
-        throw new Error("Не удалось извлечь showkey со страницы ридера");
-      }
-
-      const collectedFiles = [];
+      let lastApiCallTs = 0;
 
       for (let page = startPage; page <= endPage; page++) {
         await waitWhilePaused();
-        if (state.cancelled) {
+        if (state.cancelled || instanceAborted) {
           throw new Error("Загрузка отменена пользователем");
         }
 
         const stepIndex = page - startPage + 1;
+
+        // Smart Resume: если страница уже скачана в целевую папку — мгновенно пропускаем её без сетевых запросов!
+        if (settings.saveMode === "folder" && existingPagesMap.has(page)) {
+          skippedCount++;
+          state.current = stepIndex;
+          lastCompletedPage = page;
+          syncUI(
+            `Пропуск стр. ${page} (уже есть в папке: ${existingPagesMap.get(page)}) [${stepIndex}/${totalToDownload}]`
+          );
+          currentInfo = null;
+          currentImgKey = "";
+          continue;
+        }
+
+        // Если мы на первой нескачанной странице (или после пропущенных страниц Smart Resume) —
+        // получаем showkey и currentInfo для текущей страницы page
+        if (!currentInfo) {
+          if (!isGalleryPage && page === meta.startPage && showkey) {
+            const i3Html = document.querySelector("#i3")?.innerHTML || "";
+            const i6Html = document.querySelector("#i6")?.innerHTML || "";
+            const i7Html = document.querySelector("#i7")?.innerHTML || "";
+            const i2Html = document.querySelector("#i2")?.innerHTML || "";
+            currentInfo = parseReaderFragments(i3Html, i6Html, i7Html, i2Html);
+          } else {
+            syncUI(`Получение ключей страницы #${page}...`);
+            const readerUrl = await resolveReaderUrlForPage(page, meta);
+            const keyMatch = readerUrl.match(/\/s\/([a-f0-9]+)\/(\d+)-(\d+)/i);
+            if (keyMatch) currentImgKey = keyMatch[1];
+
+            const firstRes = await fetch(readerUrl, { credentials: "include" });
+            if (!firstRes.ok) throw new Error(`Ошибка загрузки страницы ридера #${page}`);
+            const firstHtml = await firstRes.text();
+            const parsedFirst = parseFullReaderDocument(firstHtml);
+            gid = parsedFirst.gid || gid;
+            showkey = parsedFirst.showkey || showkey;
+            apiUrl = parsedFirst.apiUrl || apiUrl;
+            currentInfo = parsedFirst;
+            lastApiCallTs = performance.now();
+          }
+        }
+
         syncUI(`Скачивание страницы ${page} из ${endPage} (${stepIndex}/${totalToDownload})...`);
 
         const { resp, usedUrl, info } = await fetchPageWithRetry({
@@ -685,14 +1033,22 @@
         currentInfo = info;
 
         const { stem, ext } = extractOriginalBaseName(usedUrl, resp.contentType, page);
-        const entryFileName = formatEntryName(page, meta.totalPages, stem, ext, settings.fileTemplate);
+        const entryFileName = formatEntryName(
+          page,
+          meta.totalPages,
+          stem,
+          ext,
+          settings.fileTemplate
+        );
 
         const bin = atob(resp.base64);
         const bytes = new Uint8Array(bin.length);
         for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
 
         if (settings.saveMode === "folder" && targetMangaDirHandle) {
-          const fileHandle = await targetMangaDirHandle.getFileHandle(entryFileName, { create: true });
+          const fileHandle = await targetMangaDirHandle.getFileHandle(entryFileName, {
+            create: true
+          });
           const writable = await fileHandle.createWritable();
           await writable.write(bytes);
           await writable.close();
@@ -701,13 +1057,19 @@
         }
 
         state.current = stepIndex;
+        lastCompletedPage = page;
         syncUI(`Готово ${stepIndex} из ${totalToDownload} (${folderName}/${entryFileName})`);
 
         if (page >= endPage) break;
 
-        let nextImgKey = currentInfo.nextImgKey;
         const nextPage = page + 1;
+        // Если следующая страница уже есть на диске (Smart Resume), не тратим запрос к api.php!
+        if (settings.saveMode === "folder" && existingPagesMap.has(nextPage)) {
+          currentInfo = null;
+          continue;
+        }
 
+        let nextImgKey = currentInfo.nextImgKey;
         if (!nextImgKey) {
           const nextReaderUrl = await resolveReaderUrlForPage(nextPage, meta);
           const m = nextReaderUrl.match(/\/s\/([a-f0-9]+)\/(\d+)-(\d+)/i);
@@ -717,14 +1079,24 @@
           throw new Error(`Не найден ключ следующей страницы после стр. ${page}`);
         }
 
+        if (!showkey) {
+          throw new Error("Не удалось извлечь showkey со страницы ридера");
+        }
+
         await waitWhilePaused();
-        if (state.cancelled) {
+        if (state.cancelled || instanceAborted) {
           throw new Error("Загрузка отменена пользователем");
         }
 
-        const delay = Math.max(1050, Number(settings.delayMs || 1200));
-        await sleep(delay);
+        // Адаптивный тайминг с джиттером: учитываем время, уже потраченное на скачивание самой картинки
+        const baseDelay = Math.max(1050, Number(settings.delayMs || 1200));
+        const jitter = 80 + Math.floor(Math.random() * 180);
+        const targetInterval = baseDelay + jitter;
+        const elapsedSinceLastApi = lastApiCallTs > 0 ? performance.now() - lastApiCallTs : targetInterval;
+        const remainingWait = Math.max(250, targetInterval - elapsedSinceLastApi);
+        await sleep(remainingWait);
 
+        lastApiCallTs = performance.now();
         const apiRes = await fetch(apiUrl, {
           method: "POST",
           credentials: "include",
@@ -747,36 +1119,66 @@
         }
 
         currentImgKey = nextImgKey;
-        currentInfo = parseReaderFragments(data.i3 || "", data.i6 || "", data.i7 || "", data.n || "");
+        currentInfo = parseReaderFragments(
+          data.i3 || "",
+          data.i6 || "",
+          data.i7 || "",
+          data.n || ""
+        );
       }
 
       if (settings.saveMode === "cbz" || settings.saveMode === "zip") {
         if (collectedFiles.length > 0) {
-          syncUI(`Упаковка ${collectedFiles.length} страниц в единый ${settings.saveMode.toUpperCase()}-архив...`);
-          const isCbz = settings.saveMode === "cbz";
-          const zipBlob = buildZipBlob(
-            collectedFiles,
-            isCbz ? "application/vnd.comicbook+zip" : "application/zip"
-          );
-          const ext = isCbz ? "cbz" : "zip";
-          const rangeSuffix = startPage === 1 && endPage === meta.totalPages ? "" : `_p${startPage}-${endPage}`;
+          const ext = settings.saveMode === "cbz" ? "cbz" : "zip";
+          const rangeSuffix =
+            startPage === 1 && endPage === meta.totalPages ? "" : `_p${startPage}-${endPage}`;
           const archiveName = `${meta.title}${rangeSuffix}.${ext}`;
 
-          const blobUrl = URL.createObjectURL(zipBlob);
-          const a = document.createElement("a");
-          a.href = blobUrl;
-          a.download = archiveName;
-          document.body.appendChild(a);
-          a.click();
-          a.remove();
-          setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
-          syncUI(`Архив "${archiveName}" (${collectedFiles.length} стр.) сохранён! Нажмите «📂 Открыть папку».`);
+          syncUI(
+            `Упаковка ${collectedFiles.length} страниц в единый ${ext.toUpperCase()}-архив...`
+          );
+          await saveArchiveToDisk(collectedFiles, meta, settings, archiveName);
+          syncUI(
+            `Архив "${archiveName}" (${collectedFiles.length} стр.) сохранён! Нажмите «📂 Открыть папку».`
+          );
         }
       } else {
-        syncUI(`Готово! Все ${totalToDownload} стр. сохранены в "${rootDirName}/${folderName}". Нажмите «📂 Открыть папку».`);
+        if (settings.includeComicInfo !== false && targetMangaDirHandle) {
+          try {
+            const ciHandle = await targetMangaDirHandle.getFileHandle("ComicInfo.xml", {
+              create: true
+            });
+            const ciWritable = await ciHandle.createWritable();
+            await ciWritable.write(buildComicInfoXml(meta));
+            await ciWritable.close();
+          } catch {
+            // ignore ComicInfo write errors
+          }
+        }
+        const skippedNote = skippedCount > 0 ? ` (пропущено существующих: ${skippedCount})` : "";
+        syncUI(
+          `Готово! Все ${totalToDownload} стр.${skippedNote} в "${rootDirName}/${folderName}". Нажмите «📂 Открыть папку».`
+        );
       }
     } catch (err) {
-      syncUI(`Остановлено: ${err.message || String(err)}`);
+      // Спасение уже скачанных страниц в частичный CBZ/ZIP при отмене или сбое на середине!
+      if (
+        (settings.saveMode === "cbz" || settings.saveMode === "zip") &&
+        collectedFiles.length > 0
+      ) {
+        try {
+          const ext = settings.saveMode === "cbz" ? "cbz" : "zip";
+          const partialName = `${meta.title}_partial_p${startPage}-${lastCompletedPage}.${ext}`;
+          await saveArchiveToDisk(collectedFiles, meta, settings, partialName);
+          syncUI(
+            `Остановлено (${err.message || String(err)}). Спасён частичный архив "${partialName}" (${collectedFiles.length} стр.)!`
+          );
+        } catch {
+          syncUI(`Остановлено: ${err.message || String(err)}`);
+        }
+      } else {
+        syncUI(`Остановлено: ${err.message || String(err)}`);
+      }
     } finally {
       state.running = false;
       state.paused = false;
@@ -785,13 +1187,21 @@
   }
 
   let uiEls = null;
+  let readerObserver = null;
 
-  function updateFolderBtnLabel(dirName) {
+  function updateFolderBtnLabel(dirName, permState = "granted") {
     if (!uiEls || !uiEls.pickDirBtn) return;
-    uiEls.pickDirBtn.textContent = dirName ? `📁 Куда: ${dirName}` : "📁 Выбрать базовую папку";
-    uiEls.pickDirBtn.title = dirName
-      ? `Текущая базовая папка: ${dirName} (внутри неё создаётся папка с названием манги). Нажмите, чтобы сменить.`
-      : "Выберите общую папку 1 раз — внутри неё будет автоматически создаваться папка для каждой манги без окон Проводника";
+    if (dirName && permState === "granted") {
+      uiEls.pickDirBtn.textContent = `📁 Куда: ${dirName}`;
+      uiEls.pickDirBtn.title = `Текущая базовая папка: ${dirName} (доступ активен). Нажмите, чтобы сменить.`;
+    } else if (dirName) {
+      uiEls.pickDirBtn.textContent = `🔓 Подтвердить папку: ${dirName}`;
+      uiEls.pickDirBtn.title = `Нажмите 1 раз, чтобы подтвердить запись в папку "${dirName}" в этой сессии браузера.`;
+    } else {
+      uiEls.pickDirBtn.textContent = "📁 Выбрать базовую папку";
+      uiEls.pickDirBtn.title =
+        "Выберите общую папку 1 раз — внутри неё будет автоматически создаваться папка для каждой манги без окон Проводника";
+    }
   }
 
   function syncUI(statusText) {
@@ -801,7 +1211,8 @@
     uiEls.progressWrap.classList.toggle("active", state.running || state.current > 0);
     uiEls.progressFill.style.width = `${pct}%`;
     uiEls.statusLabel.textContent = state.statusText;
-    uiEls.counterLabel.textContent = state.total > 0 ? `${state.current} / ${state.total} (${pct}%)` : "";
+    uiEls.counterLabel.textContent =
+      state.total > 0 ? `${state.current} / ${state.total} (${pct}%)` : "";
     uiEls.startBtn.disabled = state.running;
     uiEls.pauseBtn.disabled = !state.running;
     uiEls.pauseBtn.textContent = state.paused ? "Продолжить" : "Пауза";
@@ -809,15 +1220,31 @@
   }
 
   async function mountPanel() {
-    if (document.getElementById("mhs-root-panel")) return;
+    // Если в DOM осталась старая панель от предыдущей перезагрузки расширения — удаляем её и монтируем свежую
+    const oldPanel = document.getElementById("mhs-root-panel");
+    if (oldPanel) {
+      oldPanel.remove();
+    }
+
     const meta = detectPageMetadata();
     state.meta = meta;
-    const stored = await chrome.storage.local.get(["harvesterSettings"]);
-    const s = stored.harvesterSettings || {};
+
+    let s = {};
+    try {
+      const stored = await safeStorageGet(["harvesterSettings"]);
+      s = stored.harvesterSettings || {};
+    } catch {
+      s = {};
+    }
+
     const curMode = s.saveMode === "picker" ? "folder" : (s.saveMode || "folder");
     state.lastSaveMode = curMode;
-    const savedHandle = await getSavedRootDirHandle();
-    if (savedHandle) state.rootDirHandle = savedHandle;
+
+    const dirStatus = await querySavedDirPermissionStatus();
+    state.folderPermission = dirStatus.state;
+    if (dirStatus.handle) {
+      state.rootDirHandle = dirStatus.handle;
+    }
 
     const panel = document.createElement("div");
     panel.id = "mhs-root-panel";
@@ -825,26 +1252,24 @@
     panel.innerHTML = `
       <div class="mhs-header">
         <div class="mhs-title">
-          <span>ExManga Harvester</span>
-          <span class="mhs-badge">GID: ${meta.gid} • ${meta.totalPages} стр.</span>
+          <span>ExManga Harvester v1.9</span>
+          <span class="mhs-badge" id="mhs-badge-meta"></span>
         </div>
-        <div style="font-size:12px;color:#9aa0a6;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:440px;" title="${meta.title}">
-          Папка манги: ${meta.title}
-        </div>
+        <div class="mhs-folder-preview" id="mhs-folder-preview"></div>
       </div>
       <div class="mhs-controls">
         <div class="mhs-field">
           <label>Страницы:</label>
-          <input type="number" class="mhs-input" id="mhs-start" min="1" max="${meta.totalPages}" value="${meta.startPage}" />
+          <input type="number" class="mhs-input" id="mhs-start" min="1" />
           <span>—</span>
-          <input type="number" class="mhs-input" id="mhs-end" min="1" max="${meta.totalPages}" value="${meta.totalPages}" />
+          <input type="number" class="mhs-input" id="mhs-end" min="1" />
         </div>
         <div class="mhs-field">
           <label>Формат:</label>
           <select class="mhs-select" id="mhs-mode">
-            <option value="folder" ${curMode === "folder" ? "selected" : ""}>В папку &lt;Название манги&gt; (без окон)</option>
-            <option value="cbz" ${curMode === "cbz" ? "selected" : ""}>Единый .CBZ архив</option>
-            <option value="zip" ${curMode === "zip" ? "selected" : ""}>Единый .ZIP архив</option>
+            <option value="folder">В папку &lt;Название манги&gt; (без окон)</option>
+            <option value="cbz">Единый .CBZ архив</option>
+            <option value="zip">Единый .ZIP архив</option>
           </select>
         </div>
         <div class="mhs-field">
@@ -853,15 +1278,15 @@
         <div class="mhs-field">
           <label>Качество:</label>
           <select class="mhs-select" id="mhs-quality">
-            <option value="webp" ${s.quality !== "original" ? "selected" : ""}>Сжатый (ридер)</option>
-            <option value="original" ${s.quality === "original" ? "selected" : ""}>Оригинал (fullimg)</option>
+            <option value="webp">Сжатый (ридер)</option>
+            <option value="original">Оригинал (fullimg)</option>
           </select>
         </div>
         <div class="mhs-actions">
           <button class="mhs-btn mhs-btn-primary" id="mhs-btn-start">Скачать</button>
           <button class="mhs-btn mhs-btn-secondary" id="mhs-btn-pause" disabled>Пауза</button>
           <button class="mhs-btn mhs-btn-danger" id="mhs-btn-cancel" disabled>Отмена</button>
-          <button class="mhs-btn mhs-btn-secondary" id="mhs-btn-openfolder" title="Открыть папку в Проводнике Windows (Shift + клик — открыть прямо внутри созданной подпапки манги)">📂 Открыть папку</button>
+          <button class="mhs-btn mhs-btn-secondary" id="mhs-btn-openfolder" title="Открыть папку в Проводнике Windows (Shift + клик — выбрать/посмотреть прямо внутри созданной подпапки манги)">📂 Открыть папку</button>
         </div>
       </div>
       <div class="mhs-progress-wrap" id="mhs-progress-wrap">
@@ -893,6 +1318,8 @@
     }
 
     uiEls = {
+      badgeMeta: panel.querySelector("#mhs-badge-meta"),
+      folderPreview: panel.querySelector("#mhs-folder-preview"),
       startInput: panel.querySelector("#mhs-start"),
       endInput: panel.querySelector("#mhs-end"),
       modeSelect: panel.querySelector("#mhs-mode"),
@@ -908,14 +1335,49 @@
       counterLabel: panel.querySelector("#mhs-counter-text")
     };
 
-    updateFolderBtnLabel(savedHandle ? savedHandle.name : "");
+    // Безопасное заполнение текстовых полей через textContent (без XSS и проблем с &)
+    uiEls.badgeMeta.textContent = `GID: ${meta.gid} • ${meta.totalPages} стр.`;
+    const previewSubfolder = buildFolderPath(s.folderTemplate || "{title}", meta.gid, meta.title);
+    uiEls.folderPreview.textContent = `Папка манги: ${previewSubfolder}`;
+    uiEls.folderPreview.title = previewSubfolder;
+
+    uiEls.startInput.max = String(meta.totalPages);
+    uiEls.startInput.value = String(meta.startPage);
+    uiEls.endInput.max = String(meta.totalPages);
+    uiEls.endInput.value = String(meta.totalPages);
+    uiEls.modeSelect.value = curMode;
+    uiEls.qualitySelect.value = s.quality === "original" ? "original" : "webp";
+
+    updateFolderBtnLabel(dirStatus.name, dirStatus.state);
+
+    // Синхронизация изменений селектов на панели с хранилищем
+    const saveInlineSelects = async () => {
+      try {
+        const currentStored = await safeStorageGet(["harvesterSettings"]);
+        await safeStorageSet({
+          harvesterSettings: {
+            ...(currentStored.harvesterSettings || {}),
+            saveMode: uiEls.modeSelect.value,
+            quality: uiEls.qualitySelect.value
+          }
+        });
+      } catch {
+        // ignore
+      }
+    };
+    uiEls.modeSelect.addEventListener("change", saveInlineSelects);
+    uiEls.qualitySelect.addEventListener("change", saveInlineSelects);
 
     uiEls.pickDirBtn.addEventListener("click", async () => {
       try {
-        const handle = await ensureBaseDirectoryHandle(true);
+        // Если папка уже выбрана, но после перезапуска браузера нужно только подтвердить права ("prompt"),
+        // обычный клик подтверждает её в 1 клик, а Shift+клик позволяет выбрать совсем другую папку!
+        const forceNew = state.folderPermission === "granted" || state.folderPermission === "missing";
+        const handle = await ensureBaseDirectoryHandle(forceNew);
         state.rootDirHandle = handle;
-        updateFolderBtnLabel(handle.name);
-        syncUI(`Базовая папка выбрана: "${handle.name}". Внутри неё будет создана папка "${meta.title}".`);
+        state.folderPermission = "granted";
+        updateFolderBtnLabel(handle.name, "granted");
+        syncUI(`Базовая папка активна: "${handle.name}". Внутри неё создаётся "${meta.title}".`);
       } catch {
         // Пользователь закрыл окно выбора папки
       }
@@ -932,7 +1394,8 @@
         try {
           rootHandle = await ensureBaseDirectoryHandle(false);
           state.rootDirHandle = rootHandle;
-          updateFolderBtnLabel(rootHandle.name);
+          state.folderPermission = "granted";
+          updateFolderBtnLabel(rootHandle.name, "granted");
         } catch {
           syncUI("Выбор папки отменён");
           return;
@@ -961,35 +1424,78 @@
       state.paused = false;
       syncUI("Отмена загрузки...");
     });
+
+    // Наблюдатель за AJAX-перелистыванием страниц в читалке (/s/...),
+    // чтобы стартовая страница и метаданные всегда соответствовали открытой странице
+    if (isReaderPage) {
+      const i2 = document.querySelector("#i2");
+      if (i2) {
+        readerObserver = new MutationObserver(() => {
+          if (state.running) return;
+          const updatedMeta = detectPageMetadata();
+          state.meta = updatedMeta;
+          if (uiEls && uiEls.startInput) {
+            uiEls.startInput.value = String(updatedMeta.startPage);
+          }
+        });
+        readerObserver.observe(i2, { childList: true, subtree: true, characterData: true });
+      }
+    }
   }
 
-  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-    if (!msg || !msg.action) return false;
+  const onRuntimeMessage = (msg, sender, sendResponse) => {
+    if (instanceAborted || !msg || !msg.action) return false;
+
     if (msg.action === "getPageStatus") {
-      const meta = state.meta || detectPageMetadata();
-      sendResponse({
-        supported: true,
-        running: state.running,
-        paused: state.paused,
-        current: state.current,
-        total: state.total,
-        statusText: state.statusText,
-        lastSaveMode: state.lastSaveMode,
-        meta
+      querySavedDirPermissionStatus().then((dirStatus) => {
+        state.folderPermission = dirStatus.state;
+        const meta = state.running ? state.meta || detectPageMetadata() : detectPageMetadata();
+        state.meta = meta;
+        sendResponse({
+          supported: true,
+          running: state.running,
+          paused: state.paused,
+          current: state.current,
+          total: state.total,
+          statusText: state.statusText,
+          lastSaveMode: state.lastSaveMode,
+          folderPermission: dirStatus.state,
+          folderName: dirStatus.name,
+          meta
+        });
       });
       return true;
     }
+
     if (msg.action === "startFromPopup") {
       if (msg.options && uiEls) {
         if (msg.options.startPage) uiEls.startInput.value = msg.options.startPage;
         if (msg.options.endPage) uiEls.endInput.value = msg.options.endPage;
         if (msg.options.saveMode) uiEls.modeSelect.value = msg.options.saveMode;
         if (msg.options.quality) uiEls.qualitySelect.value = msg.options.quality;
+        if (msg.options.folderTemplate && state.meta) {
+          const previewSubfolder = buildFolderPath(
+            msg.options.folderTemplate,
+            state.meta.gid,
+            state.meta.title
+          );
+          uiEls.folderPreview.textContent = `Папка манги: ${previewSubfolder}`;
+          uiEls.folderPreview.title = previewSubfolder;
+        }
       }
       startHarvest(msg.options || {});
       sendResponse({ ok: true });
       return true;
     }
+
+    if (msg.action === "focusPickDirFromPopup") {
+      highlightPickDirButton(
+        "Нажмите подсвеченную кнопку «📁 Куда / Выбрать базовую папку» прямо на странице, чтобы выдать браузеру доступ к диску."
+      );
+      sendResponse({ ok: true });
+      return true;
+    }
+
     if (msg.action === "togglePauseFromPopup") {
       if (state.running) {
         state.paused = !state.paused;
@@ -998,6 +1504,7 @@
       sendResponse({ ok: true, paused: state.paused });
       return true;
     }
+
     if (msg.action === "cancelFromPopup") {
       if (state.running) {
         state.cancelled = true;
@@ -1006,13 +1513,40 @@
       sendResponse({ ok: true });
       return true;
     }
+
     if (msg.action === "openFolderFromPopup") {
       handleOpenDownloadedFolder(false);
       sendResponse({ ok: true });
       return true;
     }
+
     return false;
-  });
+  };
+
+  if (isExtensionContextValid()) {
+    chrome.runtime.onMessage.addListener(onRuntimeMessage);
+  }
+
+  // Если расширение перезагрузили и инжектился новый скрипт — тихо отключаем старый экземпляр
+  window.addEventListener(
+    "mhs:teardown-previous-instance",
+    () => {
+      instanceAborted = true;
+      state.cancelled = true;
+      if (readerObserver) {
+        readerObserver.disconnect();
+        readerObserver = null;
+      }
+      try {
+        if (isExtensionContextValid()) {
+          chrome.runtime.onMessage.removeListener(onRuntimeMessage);
+        }
+      } catch {
+        // ignore
+      }
+    },
+    { once: true }
+  );
 
   mountPanel();
 })();

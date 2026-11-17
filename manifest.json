@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
-  "name": "ExManga Harvester Studio (v1.8)",
+  "name": "ExManga Harvester Studio (v1.9)",
   "short_name": "ExManga Harvester",
-  "version": "1.8.0",
-  "description": "Автосохранение манги с ExHentai / E-Hentai напрямую в одноимённую папку (без 500 окон «Сохранить как») или в единый ZIP/CBZ архив с кнопкой открытия папки.",
+  "version": "1.9.0",
+  "description": "Автосохранение манги с ExHentai / E-Hentai напрямую в папку (Smart Resume, без окон «Сохранить как») или в CBZ/ZIP с ComicInfo.xml и защитой от обрывов.",
   "permissions": [
     "downloads",
     "storage",
@@ -17,7 +17,7 @@
     "service_worker": "background.js"
   },
   "action": {
-    "default_title": "ExManga Harvester Studio",
+    "default_title": "ExManga Harvester Studio v1.9",
     "default_popup": "popup.html",
     "default_icon": {
       "16": "icons/icon16.png",

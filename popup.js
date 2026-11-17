@@ -1,6 +1,7 @@
 const els = {
   title: document.getElementById("gallery-title"),
   sub: document.getElementById("gallery-sub"),
+  permBanner: document.getElementById("perm-banner"),
   startPage: document.getElementById("start-page"),
   endPage: document.getElementById("end-page"),
   saveMode: document.getElementById("save-mode"),
@@ -9,6 +10,8 @@ const els = {
   fileTemplate: document.getElementById("file-template"),
   delayMs: document.getElementById("delay-ms"),
   maxRetries: document.getElementById("max-retries"),
+  smartResume: document.getElementById("smart-resume"),
+  includeComicInfo: document.getElementById("include-comicinfo"),
   progressFill: document.getElementById("progress-fill"),
   statusText: document.getElementById("status-text"),
   counterText: document.getElementById("counter-text"),
@@ -19,7 +22,8 @@ const els = {
 };
 
 let activeTabId = null;
-let initializedRange = false;
+let initializedForGid = null;
+let lastFolderPermState = "missing";
 
 async function loadSettings() {
   const res = await chrome.storage.local.get(["harvesterSettings"]);
@@ -30,6 +34,8 @@ async function loadSettings() {
   if (s.fileTemplate) els.fileTemplate.value = s.fileTemplate;
   if (s.delayMs) els.delayMs.value = s.delayMs;
   if (s.maxRetries !== undefined) els.maxRetries.value = s.maxRetries;
+  els.smartResume.checked = s.smartResume !== false;
+  els.includeComicInfo.checked = s.includeComicInfo !== false;
 }
 
 async function saveSettings() {
@@ -39,14 +45,45 @@ async function saveSettings() {
     quality: els.quality.value,
     fileTemplate: els.fileTemplate.value,
     delayMs: Math.max(1050, Number(els.delayMs.value || 1200)),
-    maxRetries: Math.max(0, Number(els.maxRetries.value ?? 3))
+    maxRetries: Math.max(0, Number(els.maxRetries.value ?? 3)),
+    smartResume: Boolean(els.smartResume.checked),
+    includeComicInfo: Boolean(els.includeComicInfo.checked)
   };
   await chrome.storage.local.set({ harvesterSettings: settings });
   return settings;
 }
 
-for (const input of [els.saveMode, els.folderTemplate, els.quality, els.fileTemplate, els.delayMs, els.maxRetries]) {
-  input.addEventListener("change", saveSettings);
+for (const input of [
+  els.saveMode,
+  els.folderTemplate,
+  els.quality,
+  els.fileTemplate,
+  els.delayMs,
+  els.maxRetries,
+  els.smartResume,
+  els.includeComicInfo
+]) {
+  input.addEventListener("change", () => {
+    saveSettings();
+    updatePermissionBanner();
+  });
+}
+
+function updatePermissionBanner() {
+  const isFolderMode = els.saveMode.value === "folder";
+  if (!isFolderMode || lastFolderPermState === "granted") {
+    els.permBanner.classList.remove("visible");
+    els.permBanner.textContent = "";
+    return;
+  }
+  els.permBanner.classList.add("visible");
+  if (lastFolderPermState === "prompt") {
+    els.permBanner.textContent =
+      "Для записи в папку после перезапуска браузера нажмите кнопку «🔓 Подтвердить папку» или «Скачать» прямо на панели страницы (1 клик).";
+  } else {
+    els.permBanner.textContent =
+      "Базовая папка ещё не выбрана: нажмите «📁 Выбрать базовую папку» на панели страницы 1 раз.";
+  }
 }
 
 async function pollTabStatus() {
@@ -63,15 +100,19 @@ async function pollTabStatus() {
     }
 
     const meta = resp.meta;
-    els.title.textContent = meta.title;
-    els.sub.textContent = `GID: ${meta.gid} • Всего страниц: ${meta.totalPages}`;
+    lastFolderPermState = resp.folderPermission || "missing";
+    updatePermissionBanner();
 
-    if (!initializedRange) {
+    els.title.textContent = meta.title;
+    const folderInfo = resp.folderName ? ` • 📁 ${resp.folderName}` : "";
+    els.sub.textContent = `GID: ${meta.gid} • Всего страниц: ${meta.totalPages}${folderInfo}`;
+
+    if (initializedForGid !== meta.gid) {
       els.startPage.max = meta.totalPages;
       els.endPage.max = meta.totalPages;
       els.startPage.value = meta.startPage || 1;
       els.endPage.value = meta.totalPages;
-      initializedRange = true;
+      initializedForGid = meta.gid;
     }
 
     const pct = resp.total > 0 ? Math.round((resp.current / resp.total) * 100) : 0;
@@ -89,6 +130,16 @@ async function pollTabStatus() {
 els.btnStart.addEventListener("click", async () => {
   if (!activeTabId) return;
   const settings = await saveSettings();
+
+  // Если выбран режим папки, но браузер ещё не получил User Gesture на странице в этой сессии —
+  // подсвечиваем кнопку на странице и закрываем Popup, чтобы пользователь кликнул прямо по ней.
+  if (settings.saveMode === "folder" && lastFolderPermState !== "granted") {
+    chrome.tabs.sendMessage(activeTabId, { action: "focusPickDirFromPopup" }, () => {
+      window.close();
+    });
+    return;
+  }
+
   chrome.tabs.sendMessage(activeTabId, {
     action: "startFromPopup",
     options: {
@@ -111,10 +162,14 @@ els.btnCancel.addEventListener("click", () => {
 });
 
 els.btnOpenFolder.addEventListener("click", () => {
-  chrome.runtime.sendMessage({
-    action: "openDownloadsFolder",
-    preferShowLastFile: els.saveMode.value === "cbz" || els.saveMode.value === "zip"
-  });
+  if (activeTabId) {
+    chrome.tabs.sendMessage(activeTabId, { action: "openFolderFromPopup" });
+  } else {
+    chrome.runtime.sendMessage({
+      action: "openDownloadsFolder",
+      preferShowLastFile: els.saveMode.value === "cbz" || els.saveMode.value === "zip"
+    });
+  }
 });
 
 loadSettings().then(() => {
