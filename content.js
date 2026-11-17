@@ -59,7 +59,7 @@
     }
   }
 
-  // === Реестр скачанных галерей по GID в chrome.storage.local (для мгновенного распознавания дубликатов) ===
+  // === Реестр скачанных галерей по GID в chrome.storage.local ===
   async function getDownloadedGalleryRecord(gid) {
     if (!gid) return null;
     try {
@@ -199,8 +199,6 @@
     return current;
   }
 
-  // Пытается найти уже существующую подпапку манги БЕЗ её создания
-  // (ищет как по точному шаблону, так и по [GID] или названию манги в базовой папке)
   async function findExistingMangaSubfolderHandle(rootHandle, relativeFolderPath, gid, cleanTitle) {
     if (!rootHandle) return null;
     const parts = String(relativeFolderPath || "Manga")
@@ -216,7 +214,7 @@
       }
       return { handle: current, matchedPath: parts.join("/") };
     } catch {
-      // Если по текущему шаблону не нашли, проверим альтернативные варианты ([GID] Title или просто Title)
+      // проверим альтернативные шаблоны
     }
 
     const candidates = [
@@ -242,7 +240,6 @@
     return null;
   }
 
-  // Сканирование уже существующих файлов в папке манги
   async function scanExistingPagePrefixes(dirHandle) {
     const existingByPage = new Map();
     if (!dirHandle || typeof dirHandle.entries !== "function") return existingByPage;
@@ -266,7 +263,6 @@
     return existingByPage;
   }
 
-  // Проверка, есть ли уже готовый .CBZ или .ZIP архив этой манги в базовой папке
   async function findExistingArchiveInRoot(rootHandle, cleanTitle, gid) {
     if (!rootHandle) return null;
     const namesToTry = [
@@ -299,7 +295,6 @@
       state.rootDirHandle = dirStatus.handle;
     }
 
-    // 1. Если доступ к папке активен ("granted") — проверяем реальные файлы на диске!
     if (dirStatus.state === "granted" && dirStatus.handle) {
       const foundSub = await findExistingMangaSubfolderHandle(
         dirStatus.handle,
@@ -309,6 +304,7 @@
       );
       if (foundSub && foundSub.handle) {
         state.lastMangaDirHandle = foundSub.handle;
+        state.lastMatchedSubpath = foundSub.matchedPath;
         const pagesMap = await scanExistingPagePrefixes(foundSub.handle);
         const count = pagesMap.size;
         if (count >= meta.totalPages && meta.totalPages > 0) {
@@ -357,8 +353,6 @@
       }
     }
 
-    // 2. Если браузер только запущен и права на папку ещё в состоянии "prompt",
-    // проверяем быстрый реестр скачанных GID в chrome.storage.local
     const cachedRecord = await getDownloadedGalleryRecord(meta.gid);
     if (cachedRecord && cachedRecord.complete) {
       return {
@@ -477,7 +471,7 @@
       .replace(/'/g, "&apos;");
   }
 
-  function buildComicInfoXml(meta) {
+  function buildComicInfoXmlString(meta, syncToken = "") {
     const tags = meta.tags || {};
     const writer = [...(tags.artist || []), ...(tags.group || [])].join(", ");
     const series = (tags.parody || []).join(", ") || meta.title;
@@ -503,10 +497,15 @@
       `  <Manga>YesAndRightToLeft</Manga>`,
       `  <Web>${escapeXml(meta.galleryUrl || window.location.href)}</Web>`,
       `  <Notes>Downloaded with ExManga Harvester Studio v1.9 (GID: ${meta.gid})</Notes>`,
-      "</ComicInfo>"
+      "</ComicInfo>",
+      syncToken ? `<!-- mhs-sync:${syncToken} -->` : null
     ].filter(Boolean);
 
-    return new TextEncoder().encode(lines.join("\n"));
+    return lines.join("\n");
+  }
+
+  function buildComicInfoXml(meta, syncToken = "") {
+    return new TextEncoder().encode(buildComicInfoXmlString(meta, syncToken));
   }
 
   function sanitizeName(str, maxLen = 95) {
@@ -538,6 +537,81 @@
     return new Promise((r) => setTimeout(r, ms));
   }
 
+  // === Синхронизация подпапки манги с chrome.downloads для открытия её в настоящем Проводнике Windows ===
+  // Создаёт/обновляет ComicInfo.xml через chrome.downloads и проверяет через targetMangaDirHandle,
+  // что файл попал именно в нашу папку манги. Возвращает downloadId для вызова chrome.downloads.show(downloadId).
+  async function ensureExplorerDownloadIdForMangaFolder(rootHandle, targetMangaDirHandle, subfolderPath, meta) {
+    if (!targetMangaDirHandle || !meta) return null;
+
+    const syncToken = `${meta.gid}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const xmlStr = buildComicInfoXmlString(meta, syncToken);
+    const dataUrl = `data:application/xml;charset=utf-8,${encodeURIComponent(xmlStr)}`;
+
+    const rootName = rootHandle?.name ? sanitizeName(rootHandle.name, 95) : "";
+    const isRootDownloadsItself = /^(downloads|загрузки)$/i.test(rootName);
+
+    // Кандидаты относительного пути внутри системной папки загрузок Chrome:
+    // 1) Если базовая папка — подпапка внутри Загрузок (например Загрузки/Manga/<Название манги>)
+    // 2) Если базовая папка сама является папкой Загрузок (или указана как папка загрузок в настройках Chrome)
+    const candidates = isRootDownloadsItself
+      ? [
+          `${subfolderPath}/ComicInfo.xml`,
+          rootName ? `${rootName}/${subfolderPath}/ComicInfo.xml` : null
+        ]
+      : [
+          rootName ? `${rootName}/${subfolderPath}/ComicInfo.xml` : null,
+          `${subfolderPath}/ComicInfo.xml`
+        ];
+
+    const uniqueCandidates = [...new Set(candidates.filter(Boolean))];
+
+    for (const relPath of uniqueCandidates) {
+      try {
+        const res = await safeRuntimeMessage({
+          action: "createAnchorDownload",
+          dataUrl,
+          relativePath: relPath,
+          conflictAction: "overwrite"
+        });
+
+        if (!res || !res.ok || typeof res.downloadId !== "number") {
+          continue;
+        }
+
+        // Проверяем через FileSystemDirectoryHandle, действительно ли файл с нашим syncToken появился в targetMangaDirHandle!
+        let landedInTargetFolder = false;
+        try {
+          const fh = await targetMangaDirHandle.getFileHandle("ComicInfo.xml", { create: false });
+          const file = await fh.getFile();
+          const text = await file.text();
+          if (text.includes(syncToken)) {
+            landedInTargetFolder = true;
+          }
+        } catch {
+          landedInTargetFolder = false;
+        }
+
+        if (landedInTargetFolder) {
+          await saveDownloadedGalleryRecord(meta.gid, {
+            explorerDownloadId: res.downloadId,
+            folderName: subfolderPath
+          });
+          return res.downloadId;
+        } else {
+          // Если этот путь указывает мимо нашей папки манги — сразу удаляем пробник, чтобы не мусорить в Загрузках!
+          await safeRuntimeMessage({
+            action: "removeProbeDownload",
+            downloadId: res.downloadId
+          });
+        }
+      } catch {
+        // ignore and try next candidate
+      }
+    }
+
+    return null;
+  }
+
   const path = window.location.pathname;
   const isGalleryPage = path.startsWith("/g/");
   const isReaderPage = path.startsWith("/s/");
@@ -554,9 +628,10 @@
     meta: null,
     rootDirHandle: null,
     lastMangaDirHandle: null,
+    lastMatchedSubpath: "",
     lastSaveMode: "folder",
     folderPermission: "missing",
-    existingStatus: "none", // "none" | "partial_folder" | "complete_folder" | "complete_archive" | "complete_cached"
+    existingStatus: "none",
     existingCount: 0
   };
 
@@ -972,8 +1047,6 @@
     }
   }
 
-  // Сохранение собранного архива (.CBZ / .ZIP) напрямую в выбранную базовую папку манги (если она выбрана)
-  // или через менеджер загрузок браузера
   async function saveArchiveToDisk(collectedFiles, meta, settings, archiveFileName, rootHandle = null) {
     const isCbz = settings.saveMode === "cbz";
     const filesToPack = [...collectedFiles];
@@ -989,8 +1062,34 @@
       isCbz ? "application/vnd.comicbook+zip" : "application/zip"
     );
 
-    // Если у нас есть доступ к выбранной базовой папке — сохраняем архив прямо туда!
     const activeRoot = rootHandle || state.rootDirHandle;
+    const rootName = activeRoot?.name ? sanitizeName(activeRoot.name, 95) : "";
+    const isRootDownloadsItself = !rootName || /^(downloads|загрузки)$/i.test(rootName);
+
+    // Сохраняем через chrome.downloads, чтобы Проводник Windows открывал именно этот архив по кнопке «📂 Открыть папку»
+    const blobUrl = URL.createObjectURL(zipBlob);
+    const dlRelPath = isRootDownloadsItself ? archiveFileName : `${rootName}/${archiveFileName}`;
+    try {
+      const dlResp = await safeRuntimeMessage({
+        action: "downloadArchiveBlobUrl",
+        blobUrl,
+        filename: dlRelPath
+      });
+      if (dlResp && dlResp.ok) {
+        if (typeof dlResp.downloadId === "number") {
+          await saveDownloadedGalleryRecord(meta.gid, {
+            explorerDownloadId: dlResp.downloadId,
+            archiveName: archiveFileName
+          });
+        }
+        setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
+        return { savedInRootDir: !isRootDownloadsItself, dirName: rootName || "Загрузки" };
+      }
+    } catch {
+      // Fallback
+    }
+
+    // Если выбрана папка вне Загрузок — также записываем копию напрямую в выбранную базовую папку
     if (activeRoot) {
       try {
         const perm = await activeRoot.queryPermission({ mode: "readwrite" });
@@ -999,26 +1098,12 @@
           const writable = await fileHandle.createWritable();
           await writable.write(zipBlob);
           await writable.close();
+          setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
           return { savedInRootDir: true, dirName: activeRoot.name };
         }
       } catch {
-        // Если не удалось записать напрямую — используем штатное скачивание ниже
+        // ignore
       }
-    }
-
-    const blobUrl = URL.createObjectURL(zipBlob);
-    try {
-      const dlResp = await safeRuntimeMessage({
-        action: "downloadArchiveBlobUrl",
-        blobUrl,
-        filename: archiveFileName
-      });
-      if (dlResp && dlResp.ok) {
-        setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
-        return { savedInRootDir: false };
-      }
-    } catch {
-      // Fallback на <a download>
     }
 
     const a = document.createElement("a");
@@ -1028,70 +1113,95 @@
     a.click();
     a.remove();
     setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
-    return { savedInRootDir: false };
+    return { savedInRootDir: false, dirName: "Загрузки" };
   }
 
-  // === ОТКРЫТИЕ ПАПКИ МАНГИ (без ухода в системные «Загрузки»!) ===
+  // === ОТКРЫТИЕ ПАПКИ С МАНГОЙ В НАСТОЯЩЕМ ПРОВОДНИКЕ WINDOWS (`explorer.exe`) ===
+  // Никаких странных модальных окон «Выбор папки для сайта» — только настоящий Проводник Windows!
   async function handleOpenDownloadedFolder() {
     try {
-      // 1. Получаем сохранённую базовую папку, куда пользователь сохраняет мангу
+      const meta = state.meta || detectPageMetadata();
+      const cachedRecord = await getDownloadedGalleryRecord(meta.gid);
+
+      // 1. Если для этой манги уже есть проверенный downloadId в истории загрузок Chrome —
+      // сразу открываем её папку в настоящем Проводнике Windows!
+      if (cachedRecord && typeof cachedRecord.explorerDownloadId === "number") {
+        const showRes = await safeRuntimeMessage({
+          action: "showDownloadIdInExplorer",
+          downloadId: cachedRecord.explorerDownloadId
+        });
+        if (showRes && showRes.ok) {
+          return;
+        }
+      }
+
+      // 2. Если папка с этой мангой уже есть на диске, но downloadId ещё не привязан —
+      // создаём привязку через ComicInfo.xml и открываем эту подпапку в настоящем Проводнике Windows!
       let rootHandle = state.rootDirHandle || (await getSavedRootDirHandle());
       if (rootHandle) {
         let perm = await rootHandle.queryPermission({ mode: "readwrite" });
         if (perm !== "granted") {
-          perm = await rootHandle.requestPermission({ mode: "readwrite" });
+          try {
+            perm = await rootHandle.requestPermission({ mode: "readwrite" });
+          } catch {
+            // ignore
+          }
         }
         if (perm === "granted") {
           state.rootDirHandle = rootHandle;
           state.folderPermission = "granted";
           updateFolderBtnLabel(rootHandle.name, "granted");
 
-          // Проверяем, есть ли уже созданная подпапка для текущей манги
-          let targetDirToOpen = state.lastMangaDirHandle;
-          if (!targetDirToOpen && state.meta) {
-            const stored = await safeStorageGet(["harvesterSettings"]);
-            const tpl = stored?.harvesterSettings?.folderTemplate || "{title}";
-            const folderName = buildFolderPath(tpl, state.meta.gid, state.meta.title);
+          const stored = await safeStorageGet(["harvesterSettings"]);
+          const tpl = stored?.harvesterSettings?.folderTemplate || "{title}";
+          const folderName = buildFolderPath(tpl, meta.gid, meta.title);
+
+          let targetSubHandle = state.lastMangaDirHandle;
+          let matchedSubpath = state.lastMatchedSubpath || folderName;
+
+          if (!targetSubHandle) {
             const foundSub = await findExistingMangaSubfolderHandle(
               rootHandle,
               folderName,
-              state.meta.gid,
-              state.meta.title
+              meta.gid,
+              meta.title
             );
             if (foundSub && foundSub.handle) {
-              targetDirToOpen = foundSub.handle;
+              targetSubHandle = foundSub.handle;
+              matchedSubpath = foundSub.matchedPath;
               state.lastMangaDirHandle = foundSub.handle;
+              state.lastMatchedSubpath = foundSub.matchedPath;
             }
           }
 
-          // Открываем нативное окно Проводника прямо внутри папки манги (или базовой папки манги, если эта глава ещё не скачана)
-          await window.showDirectoryPicker({
-            startIn: targetDirToOpen || rootHandle,
-            mode: "readwrite"
-          });
-          return;
+          if (targetSubHandle) {
+            const dlId = await ensureExplorerDownloadIdForMangaFolder(
+              rootHandle,
+              targetSubHandle,
+              matchedSubpath,
+              meta
+            );
+            if (typeof dlId === "number") {
+              const showRes = await safeRuntimeMessage({
+                action: "showDownloadIdInExplorer",
+                downloadId: dlId
+              });
+              if (showRes && showRes.ok) {
+                return;
+              }
+            } else {
+              syncUI(
+                `Папка "${rootHandle.name}/${matchedSubpath}" находится вне системной папки Загрузок Chrome. Чтобы Проводник открывал её напрямую, укажите "${rootHandle.name}" как папку загрузок в chrome://settings/downloads.`
+              );
+            }
+          }
         }
       }
-    } catch (err) {
-      // Если пользователь просто закрыл диалог Проводника (AbortError) — ничего больше делать не нужно
-      if (err && err.name === "AbortError") {
-        return;
-      }
-      if (err && err.name === "SecurityError") {
-        highlightButton(
-          uiEls?.openFolderBtn,
-          "Нажмите кнопку «📂 Открыть папку» прямо на панели страницы, чтобы открыть вашу папку манги."
-        );
-        return;
-      }
-    }
 
-    // Фоллбэк на системные «Загрузки» ТОЛЬКО если пользователь вообще не выбирал свою базовую папку
-    const preferShowLastFile = state.lastSaveMode === "cbz" || state.lastSaveMode === "zip";
-    try {
+      // 3. Фоллбэк: открываем последний скачанный файл или папку Загрузок в настоящем Проводнике Windows
       await safeRuntimeMessage({
         action: "openDownloadsFolder",
-        preferShowLastFile
+        preferShowLastFile: true
       });
     } catch (err) {
       syncUI(err.message || String(err));
@@ -1168,7 +1278,6 @@
     let rootDirName = "";
     let existingPagesMap = new Map();
 
-    // Получаем доступ к базовой папке (для режима folder — обязательно, для cbz/zip — если она уже была выбрана)
     if (settings.saveMode === "folder") {
       try {
         rootHandle = rootHandle || (await ensureBaseDirectoryHandle(false));
@@ -1209,7 +1318,6 @@
     }
 
     // === ПРОВЕРКА НА ДУБЛИКАТ ПЕРЕД СКАЧИВАНИЕМ ===
-    // Если не зажат Shift (forceRedownload === false) и включён Smart Resume — проверяем, не лежит ли уже эта манга в папке!
     if (!forceRedownload && settings.smartResume !== false && rootHandle) {
       if (settings.saveMode === "folder") {
         const existingSub = await findExistingMangaSubfolderHandle(
@@ -1221,9 +1329,9 @@
         if (existingSub && existingSub.handle) {
           targetMangaDirHandle = existingSub.handle;
           state.lastMangaDirHandle = existingSub.handle;
+          state.lastMatchedSubpath = existingSub.matchedPath;
           existingPagesMap = await scanExistingPagePrefixes(existingSub.handle);
 
-          // Считаем, сколько страниц из запрошенного диапазона [startPage..endPage] уже лежит в папке
           let alreadyHaveInRange = 0;
           for (let p = startPage; p <= endPage; p++) {
             if (existingPagesMap.has(p)) alreadyHaveInRange++;
@@ -1234,6 +1342,12 @@
             state.existingCount = existingPagesMap.size;
             state.current = totalToDownload;
             state.total = totalToDownload;
+            await ensureExplorerDownloadIdForMangaFolder(
+              rootHandle,
+              existingSub.handle,
+              existingSub.matchedPath,
+              meta
+            );
             await saveDownloadedGalleryRecord(meta.gid, {
               title: meta.title,
               folderName: existingSub.matchedPath,
@@ -1267,6 +1381,7 @@
     if (settings.saveMode === "folder" && !targetMangaDirHandle) {
       targetMangaDirHandle = await getOrCreateSubfolderHandle(rootHandle, folderName);
       state.lastMangaDirHandle = targetMangaDirHandle;
+      state.lastMatchedSubpath = folderName;
       if (!forceRedownload && settings.smartResume !== false) {
         existingPagesMap = await scanExistingPagePrefixes(targetMangaDirHandle);
       }
@@ -1299,7 +1414,6 @@
 
         const stepIndex = page - startPage + 1;
 
-        // Smart Resume: если страница уже есть в папке — пропускаем её
         if (!forceRedownload && settings.saveMode === "folder" && existingPagesMap.has(page)) {
           skippedCount++;
           state.current = stepIndex;
@@ -1479,7 +1593,7 @@
           );
         }
       } else {
-        if (settings.includeComicInfo !== false && targetMangaDirHandle) {
+        if (targetMangaDirHandle) {
           try {
             const ciHandle = await targetMangaDirHandle.getFileHandle("ComicInfo.xml", {
               create: true
@@ -1490,6 +1604,13 @@
           } catch {
             // ignore ComicInfo write errors
           }
+          // Синхронизируем downloadId папки для мгновенного открытия в настоящем Проводнике Windows
+          await ensureExplorerDownloadIdForMangaFolder(
+            rootHandle,
+            targetMangaDirHandle,
+            folderName,
+            meta
+          );
         }
         state.existingStatus = "complete_folder";
         state.existingCount = meta.totalPages;
@@ -1689,7 +1810,7 @@
           <button class="mhs-btn mhs-btn-primary" id="mhs-btn-start">Скачать</button>
           <button class="mhs-btn mhs-btn-secondary" id="mhs-btn-pause" disabled>Пауза</button>
           <button class="mhs-btn mhs-btn-danger" id="mhs-btn-cancel" disabled>Отмена</button>
-          <button class="mhs-btn mhs-btn-secondary" id="mhs-btn-openfolder" title="Открыть именно ту папку, куда сохраняется манга (подпапку манги или вашу базовую папку)">📂 Открыть папку</button>
+          <button class="mhs-btn mhs-btn-secondary" id="mhs-btn-openfolder" title="Открыть папку с этой мангой в обычном Проводнике Windows">📂 Открыть папку</button>
         </div>
       </div>
       <div class="mhs-progress-wrap" id="mhs-progress-wrap">
@@ -1753,7 +1874,6 @@
 
     updateFolderBtnLabel(dirStatus.name, dirStatus.state);
 
-    // Сразу при загрузке страницы проверяем, не скачана ли уже эта манга!
     await refreshExistingStatusOnPanel(s.folderTemplate || "{title}");
 
     const saveInlineSelects = async () => {
@@ -1907,8 +2027,6 @@
     }
 
     if (msg.action === "openFolderFromPopup") {
-      // Поскольку открытие кастомной папки через File System Access API требует клика на самой странице,
-      // пробуем открыть сразу, а если браузер требует User Gesture — подсвечиваем кнопку «📂 Открыть папку» на панели!
       handleOpenDownloadedFolder();
       sendResponse({ ok: true });
       return true;

@@ -23,6 +23,30 @@ const TARGET_URL_PATTERNS = [
   "*://*.e-hentai.org/s/*"
 ];
 
+function sanitizeDownloadRelativePath(rawPath) {
+  return String(rawPath || "Manga/ComicInfo.xml")
+    .replace(/\\/g, "/")
+    .split("/")
+    .map((part, idx, arr) => {
+      const isLast = idx === arr.length - 1;
+      let clean = part
+        .replace(/[\\/:*?"<>|~\x00-\x1f]/g, "_")
+        .replace(/\s+/g, " ")
+        .trim();
+      if (!isLast) {
+        clean = clean.replace(/^[. ]+|[. ]+$/g, "");
+      } else {
+        clean = clean.replace(/^[. ]+/, "");
+      }
+      if (/^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\..*)?$/i.test(clean)) {
+        clean = `_${clean}`;
+      }
+      return clean || (isLast ? "ComicInfo.xml" : "Manga");
+    })
+    .filter(Boolean)
+    .join("/");
+}
+
 async function getLastDownloadId() {
   try {
     if (chrome.storage.session) {
@@ -52,8 +76,79 @@ async function setLastDownloadId(downloadId) {
   }
 }
 
-// Автоматическое переподключение content.js во всех открытых вкладках ExHentai/E-Hentai
-// после обновления или перезагрузки расширения в chrome://extensions (лечит "Extension context invalidated")
+// Скачивание небольшого файла/архива через chrome.downloads с ожиданием завершения записи на диск,
+// чтобы вызов chrome.downloads.show(downloadId) гарантированно открывал именно эту подпапку в Проводнике Windows
+function downloadUrlAndWait(url, rawFilename, conflictAction = "overwrite", timeoutMs = 4500) {
+  const filename = sanitizeDownloadRelativePath(rawFilename);
+  return new Promise((resolve) => {
+    chrome.downloads.download(
+      {
+        url,
+        filename,
+        conflictAction,
+        saveAs: false
+      },
+      (downloadId) => {
+        if (chrome.runtime.lastError || typeof downloadId !== "number") {
+          resolve({
+            ok: false,
+            error: chrome.runtime.lastError?.message || "Не удалось создать задачу загрузки"
+          });
+          return;
+        }
+
+        let settled = false;
+        const finish = (result) => {
+          if (settled) return;
+          settled = true;
+          chrome.downloads.onChanged.removeListener(onChanged);
+          clearTimeout(timer);
+          resolve(result);
+        };
+
+        const onChanged = (delta) => {
+          if (delta.id !== downloadId) return;
+          if (delta.state && delta.state.current === "complete") {
+            finish({ ok: true, downloadId, filename });
+          } else if (delta.state && delta.state.current === "interrupted") {
+            finish({ ok: false, downloadId, error: "Загрузка прервана" });
+          }
+        };
+
+        chrome.downloads.onChanged.addListener(onChanged);
+
+        chrome.downloads.search({ id: downloadId }, (items) => {
+          if (items && items[0]) {
+            if (items[0].state === "complete") {
+              finish({ ok: true, downloadId, filename, fullPath: items[0].filename });
+            } else if (items[0].state === "interrupted") {
+              finish({ ok: false, downloadId, error: "Загрузка прервана" });
+            }
+          }
+        });
+
+        const timer = setTimeout(() => {
+          finish({ ok: false, downloadId, error: "Таймаут ожидания записи файла" });
+        }, timeoutMs);
+      }
+    );
+  });
+}
+
+function cleanupProbeDownload(downloadId) {
+  if (typeof downloadId !== "number") return;
+  try {
+    chrome.downloads.removeFile(downloadId, () => {
+      void chrome.runtime.lastError;
+      chrome.downloads.erase({ id: downloadId }, () => {
+        void chrome.runtime.lastError;
+      });
+    });
+  } catch {
+    // ignore
+  }
+}
+
 async function reinjectOpenGalleryTabs() {
   try {
     const tabs = await chrome.tabs.query({ url: TARGET_URL_PATTERNS });
@@ -183,35 +278,73 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
-  // Скачивание архива через chrome.downloads с точным запоминанием его downloadId
-  if (msg.action === "downloadArchiveBlobUrl") {
-    chrome.downloads.download(
-      {
-        url: msg.blobUrl,
-        filename: msg.filename || "Manga.cbz",
-        conflictAction: "uniquify",
-        saveAs: false
-      },
-      async (downloadId) => {
-        if (chrome.runtime.lastError || typeof downloadId !== "number") {
-          sendResponse({
-            ok: false,
-            error: chrome.runtime.lastError?.message || "Не удалось сохранить архив через браузер"
-          });
-          return;
-        }
-        await setLastDownloadId(downloadId);
-        sendResponse({ ok: true, downloadId });
+  // Запись якорного файла (например, ComicInfo.xml) в подпапку манги через chrome.downloads
+  // для получения системного downloadId, который открывает эту подпапку в настоящем Проводнике Windows
+  if (msg.action === "createAnchorDownload") {
+    (async () => {
+      const res = await downloadUrlAndWait(
+        msg.dataUrl,
+        msg.relativePath,
+        msg.conflictAction || "overwrite",
+        3500
+      );
+      if (res.ok && typeof res.downloadId === "number") {
+        await setLastDownloadId(res.downloadId);
       }
-    );
+      sendResponse(res);
+    })();
     return true;
   }
 
-  // Открытие папки со скачанной мангой в Проводнике Windows
+  if (msg.action === "removeProbeDownload") {
+    cleanupProbeDownload(msg.downloadId);
+    sendResponse({ ok: true });
+    return true;
+  }
+
+  // Скачивание архива через chrome.downloads с точным запоминанием его downloadId
+  if (msg.action === "downloadArchiveBlobUrl") {
+    (async () => {
+      const res = await downloadUrlAndWait(
+        msg.blobUrl,
+        msg.filename || "Manga.cbz",
+        "uniquify",
+        15000
+      );
+      if (res.ok && typeof res.downloadId === "number") {
+        await setLastDownloadId(res.downloadId);
+      }
+      sendResponse(res);
+    })();
+    return true;
+  }
+
+  // Открытие конкретного downloadId в настоящем Проводнике Windows (explorer.exe /select,...)
+  if (msg.action === "showDownloadIdInExplorer") {
+    const targetId = typeof msg.downloadId === "number" ? msg.downloadId : null;
+    (async () => {
+      const idToShow = targetId !== null ? targetId : await getLastDownloadId();
+      if (idToShow !== null) {
+        chrome.downloads.search({ id: idToShow }, (items) => {
+          if (items && items.length > 0 && items[0].exists !== false) {
+            chrome.downloads.show(idToShow);
+            sendResponse({ ok: true, mode: "show_item", downloadId: idToShow });
+          } else {
+            sendResponse({ ok: false, error: "Файл не найден в истории загрузок Chrome" });
+          }
+        });
+        return;
+      }
+      sendResponse({ ok: false, error: "Нет привязанного downloadId" });
+    })();
+    return true;
+  }
+
+  // Фоллбэк: открытие папки в Проводнике Windows
   if (msg.action === "openDownloadsFolder") {
     (async () => {
       const lastId = await getLastDownloadId();
-      if (msg.preferShowLastFile && lastId !== null) {
+      if (lastId !== null) {
         chrome.downloads.search({ id: lastId }, (items) => {
           if (items && items.length > 0 && items[0].exists !== false) {
             chrome.downloads.show(lastId);
