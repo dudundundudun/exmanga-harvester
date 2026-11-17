@@ -105,7 +105,15 @@ async function pollTabStatus() {
 
     els.title.textContent = meta.title;
     const folderInfo = resp.folderName ? ` • 📁 ${resp.folderName}` : "";
-    els.sub.textContent = `GID: ${meta.gid} • Всего страниц: ${meta.totalPages}${folderInfo}`;
+    const existingInfo =
+      resp.existingStatus === "complete_folder" ||
+      resp.existingStatus === "complete_archive" ||
+      resp.existingStatus === "complete_cached"
+        ? " • ✅ Уже в папке"
+        : resp.existingStatus === "partial_folder"
+          ? ` • ⚠️ В папке ${resp.existingCount}/${meta.totalPages}`
+          : "";
+    els.sub.textContent = `GID: ${meta.gid} • ${meta.totalPages} стр.${folderInfo}${existingInfo}`;
 
     if (initializedForGid !== meta.gid) {
       els.startPage.max = meta.totalPages;
@@ -121,18 +129,29 @@ async function pollTabStatus() {
     els.counterText.textContent = resp.total > 0 ? `${resp.current}/${resp.total}` : "";
 
     els.btnStart.disabled = resp.running;
+    if (!resp.running) {
+      if (
+        resp.existingStatus === "complete_folder" ||
+        resp.existingStatus === "complete_archive" ||
+        resp.existingStatus === "complete_cached"
+      ) {
+        els.btnStart.textContent = "✅ Уже скачано";
+      } else if (resp.existingStatus === "partial_folder") {
+        els.btnStart.textContent = "▶ Докачать";
+      } else {
+        els.btnStart.textContent = "Скачать";
+      }
+    }
     els.btnPause.disabled = !resp.running;
     els.btnPause.textContent = resp.paused ? "Продолжить" : "Пауза";
     els.btnCancel.disabled = !resp.running;
   });
 }
 
-els.btnStart.addEventListener("click", async () => {
+els.btnStart.addEventListener("click", async (e) => {
   if (!activeTabId) return;
   const settings = await saveSettings();
 
-  // Если выбран режим папки, но браузер ещё не получил User Gesture на странице в этой сессии —
-  // подсвечиваем кнопку на странице и закрываем Popup, чтобы пользователь кликнул прямо по ней.
   if (settings.saveMode === "folder" && lastFolderPermState !== "granted") {
     chrome.tabs.sendMessage(activeTabId, { action: "focusPickDirFromPopup" }, () => {
       window.close();
@@ -142,6 +161,7 @@ els.btnStart.addEventListener("click", async () => {
 
   chrome.tabs.sendMessage(activeTabId, {
     action: "startFromPopup",
+    forceRedownload: Boolean(e.shiftKey),
     options: {
       ...settings,
       startPage: Number(els.startPage.value || 1),
@@ -163,7 +183,9 @@ els.btnCancel.addEventListener("click", () => {
 
 els.btnOpenFolder.addEventListener("click", () => {
   if (activeTabId) {
-    chrome.tabs.sendMessage(activeTabId, { action: "openFolderFromPopup" });
+    chrome.tabs.sendMessage(activeTabId, { action: "openFolderFromPopup" }, () => {
+      window.close();
+    });
   } else {
     chrome.runtime.sendMessage({
       action: "openDownloadsFolder",
