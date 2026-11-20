@@ -3,7 +3,60 @@
   // посылаем ему сигнал завершения и заменяем панель на живую.
   window.dispatchEvent(new CustomEvent("mhs:teardown-previous-instance"));
 
+  const ZIP = globalThis.MHS_ZIP;
+  const PARSER = globalThis.MHS_PARSER;
+  if (!ZIP || !PARSER) {
+    console.error("[ExManga Harvester] Не загружены модули zip_builder.js / parser.js");
+    return;
+  }
+
+  const { buildZipBlob, buildComicInfoXml } = ZIP;
+  const {
+    sanitizeName,
+    buildFolderPath,
+    parseGalleryTags,
+    computeGalleryPagination,
+    detectPageMetadata: detectMetaWithMode,
+    parseReaderFragments,
+    parseFullReaderDocument,
+    findReaderLinkInGalleryDoc,
+    extractOriginalBaseName,
+    formatEntryName
+  } = PARSER;
+
   let instanceAborted = false;
+
+  const NETWORK_TIMEOUT_MS = 20000;
+  const API_MAX_RETRIES = 3;
+  const MAX_ARCHIVE_PART_BYTES = 450 * 1024 * 1024; // 450 МБ на один том CBZ/ZIP (защита от OOM)
+
+  function sleep(ms) {
+    return new Promise((r) => setTimeout(r, ms));
+  }
+
+  function base64ToUint8Array(base64) {
+    const bin = atob(base64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) {
+      bytes[i] = bin.charCodeAt(i);
+    }
+    return bytes;
+  }
+
+  async function fetchWithTimeout(url, options = {}, timeoutMs = NETWORK_TIMEOUT_MS) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await fetch(url, { ...options, signal: controller.signal });
+    } catch (err) {
+      if (err && err.name === "AbortError") {
+        throw new Error(`Таймаут сетевого запроса (${Math.round(timeoutMs / 1000)} с)`);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
 
   // === Проверка валидности контекста расширения (защита от "Extension context invalidated") ===
   function isExtensionContextValid() {
@@ -107,8 +160,9 @@
   }
 
   async function getSavedRootDirHandle() {
+    let db = null;
     try {
-      const db = await openHandleDB();
+      db = await openHandleDB();
       return await new Promise((resolve, reject) => {
         const tx = db.transaction(IDB_STORE, "readonly");
         const req = tx.objectStore(IDB_STORE).get(IDB_KEY);
@@ -117,12 +171,21 @@
       });
     } catch {
       return null;
+    } finally {
+      if (db) {
+        try {
+          db.close();
+        } catch {
+          // ignore
+        }
+      }
     }
   }
 
   async function saveRootDirHandle(handle) {
+    let db = null;
     try {
-      const db = await openHandleDB();
+      db = await openHandleDB();
       await new Promise((resolve, reject) => {
         const tx = db.transaction(IDB_STORE, "readwrite");
         tx.objectStore(IDB_STORE).put(handle, IDB_KEY);
@@ -131,6 +194,14 @@
       });
     } catch {
       // ignore IDB errors
+    } finally {
+      if (db) {
+        try {
+          db.close();
+        } catch {
+          // ignore
+        }
+      }
     }
   }
 
@@ -189,6 +260,7 @@
     const parts = String(relativeFolderPath || "Manga")
       .replace(/\\/g, "/")
       .split("/")
+      .filter((s) => s && s !== "." && s !== "..")
       .map((s) => sanitizeName(s, 95))
       .filter(Boolean);
 
@@ -204,6 +276,7 @@
     const parts = String(relativeFolderPath || "Manga")
       .replace(/\\/g, "/")
       .split("/")
+      .filter((s) => s && s !== "." && s !== "..")
       .map((s) => sanitizeName(s, 95))
       .filter(Boolean);
 
@@ -286,7 +359,6 @@
     return null;
   }
 
-  // Комплексная проверка: лежит ли уже эта манга в выбранной папке (или в реестре GID)
   async function inspectExistingMangaStatus(meta, folderTemplate) {
     const folderName = buildFolderPath(folderTemplate || "{title}", meta.gid, meta.title);
     const dirStatus = await querySavedDirPermissionStatus();
@@ -373,172 +445,6 @@
     };
   }
 
-  // === Встроенный упаковщик PKZIP (STORE = 0 + CRC32 + DOS timestamps + UTF-8) ===
-  const CRC_TABLE = (() => {
-    const t = new Uint32Array(256);
-    for (let i = 0; i < 256; i++) {
-      let c = i;
-      for (let k = 0; k < 8; k++) {
-        c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-      }
-      t[i] = c >>> 0;
-    }
-    return t;
-  })();
-
-  function crc32(bytes) {
-    let crc = 0xffffffff;
-    for (let i = 0; i < bytes.length; i++) {
-      crc = CRC_TABLE[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
-    }
-    return (crc ^ 0xffffffff) >>> 0;
-  }
-
-  function buildZipBlob(files, mimeType = "application/zip") {
-    const encoder = new TextEncoder();
-    const localParts = [];
-    const centralParts = [];
-    let offset = 0;
-
-    const now = new Date();
-    const dosTime =
-      ((now.getHours() & 0x1f) << 11) |
-      ((now.getMinutes() & 0x3f) << 5) |
-      ((now.getSeconds() >> 1) & 0x1f);
-    const dosDate =
-      (((now.getFullYear() - 1980) & 0x7f) << 9) |
-      (((now.getMonth() + 1) & 0x0f) << 5) |
-      (now.getDate() & 0x1f);
-
-    for (const file of files) {
-      const nameBytes = encoder.encode(file.name);
-      const data = file.data instanceof Uint8Array ? file.data : encoder.encode(String(file.data));
-      const crc = crc32(data);
-
-      const lfh = new Uint8Array(30 + nameBytes.length);
-      const lfhView = new DataView(lfh.buffer);
-      lfhView.setUint32(0, 0x04034b50, true);
-      lfhView.setUint16(4, 20, true);
-      lfhView.setUint16(6, 0x0800, true);
-      lfhView.setUint16(8, 0, true);
-      lfhView.setUint16(10, dosTime, true);
-      lfhView.setUint16(12, dosDate, true);
-      lfhView.setUint32(14, crc, true);
-      lfhView.setUint32(18, data.length, true);
-      lfhView.setUint32(22, data.length, true);
-      lfhView.setUint16(26, nameBytes.length, true);
-      lfh.set(nameBytes, 30);
-
-      const cdh = new Uint8Array(46 + nameBytes.length);
-      const cdhView = new DataView(cdh.buffer);
-      cdhView.setUint32(0, 0x02014b50, true);
-      cdhView.setUint16(4, 20, true);
-      cdhView.setUint16(6, 20, true);
-      cdhView.setUint16(8, 0x0800, true);
-      cdhView.setUint16(10, 0, true);
-      cdhView.setUint16(12, dosTime, true);
-      cdhView.setUint16(14, dosDate, true);
-      cdhView.setUint32(16, crc, true);
-      cdhView.setUint32(20, data.length, true);
-      cdhView.setUint32(24, data.length, true);
-      cdhView.setUint16(28, nameBytes.length, true);
-      cdhView.setUint32(42, offset, true);
-      cdh.set(nameBytes, 46);
-
-      localParts.push(lfh, data);
-      centralParts.push(cdh);
-      offset += lfh.length + data.length;
-    }
-
-    const cdSize = centralParts.reduce((acc, p) => acc + p.length, 0);
-    const eocd = new Uint8Array(22);
-    const eocdView = new DataView(eocd.buffer);
-    eocdView.setUint32(0, 0x06054b50, true);
-    eocdView.setUint16(8, files.length, true);
-    eocdView.setUint16(10, files.length, true);
-    eocdView.setUint32(12, cdSize, true);
-    eocdView.setUint32(16, offset, true);
-
-    return new Blob([...localParts, ...centralParts, eocd], { type: mimeType });
-  }
-
-  function escapeXml(str) {
-    return String(str || "")
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;")
-      .replace(/'/g, "&apos;");
-  }
-
-  function buildComicInfoXmlString(meta, syncToken = "") {
-    const tags = meta.tags || {};
-    const writer = [...(tags.artist || []), ...(tags.group || [])].join(", ");
-    const series = (tags.parody || []).join(", ") || meta.title;
-    const characters = (tags.character || []).join(", ");
-    const genre = [...(tags.female || []), ...(tags.male || []), ...(tags.misc || [])].join(", ");
-    const langList = tags.language || [];
-    let langIso = "ja";
-    if (langList.includes("russian")) langIso = "ru";
-    else if (langList.includes("english")) langIso = "en";
-    else if (langList.includes("chinese")) langIso = "zh";
-
-    const lines = [
-      '<?xml version="1.0" encoding="utf-8"?>',
-      '<ComicInfo xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">',
-      `  <Title>${escapeXml(meta.rawTitle || meta.title)}</Title>`,
-      `  <Series>${escapeXml(series)}</Series>`,
-      meta.jpTitle ? `  <AlternateSeries>${escapeXml(meta.jpTitle)}</AlternateSeries>` : null,
-      writer ? `  <Writer>${escapeXml(writer)}</Writer>` : null,
-      characters ? `  <Characters>${escapeXml(characters)}</Characters>` : null,
-      genre ? `  <Genre>${escapeXml(genre)}</Genre>` : null,
-      `  <PageCount>${Number(meta.totalPages || 0)}</PageCount>`,
-      `  <LanguageISO>${escapeXml(langIso)}</LanguageISO>`,
-      `  <Manga>YesAndRightToLeft</Manga>`,
-      `  <Web>${escapeXml(meta.galleryUrl || window.location.href)}</Web>`,
-      `  <Notes>Downloaded with ExManga Harvester Studio v1.9 (GID: ${meta.gid})</Notes>`,
-      "</ComicInfo>",
-      syncToken ? `<!-- mhs-sync:${syncToken} -->` : null
-    ].filter(Boolean);
-
-    return lines.join("\n");
-  }
-
-  function buildComicInfoXml(meta, syncToken = "") {
-    return new TextEncoder().encode(buildComicInfoXmlString(meta, syncToken));
-  }
-
-  function sanitizeName(str, maxLen = 95) {
-    let clean = (str || "Manga")
-      .replace(/[\\/:*?"<>|~\x00-\x1f]/g, "_")
-      .replace(/\s+/g, " ")
-      .trim()
-      .slice(0, maxLen)
-      .replace(/^[. ]+|[. ]+$/g, "");
-    if (/^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\..*)?$/i.test(clean)) {
-      clean = `_${clean}`;
-    }
-    return clean || "Manga";
-  }
-
-  function buildFolderPath(template, gid, title) {
-    const cleanTitle = sanitizeName(title, 95);
-    const raw = (template || "{title}")
-      .replace(/\{gid\}/g, String(gid))
-      .replace(/\{title\}/g, cleanTitle);
-    return raw
-      .split("/")
-      .map((part) => sanitizeName(part, 95))
-      .filter(Boolean)
-      .join("/");
-  }
-
-  function sleep(ms) {
-    return new Promise((r) => setTimeout(r, ms));
-  }
-
-  // === Тихое сохранение ComicInfo.xml напрямую в папку манги через File System Access API ===
-  // Записывает файл точно так же, как страницы манги — без вызовов chrome.downloads и без окон «Сохранить как».
   async function writeComicInfoDirectly(targetMangaDirHandle, meta, includeComicInfo = true) {
     if (!targetMangaDirHandle || !meta || includeComicInfo === false) return false;
     try {
@@ -560,6 +466,10 @@
 
   if (!isGalleryPage && !isReaderPage) return;
 
+  function detectPageMetadata() {
+    return detectMetaWithMode(isGalleryPage);
+  }
+
   const state = {
     running: false,
     paused: false,
@@ -576,242 +486,6 @@
     existingStatus: "none",
     existingCount: 0
   };
-
-  function parseInlineScripts(doc = document) {
-    const text = Array.from(doc.scripts).map((s) => s.textContent || "").join("\n");
-    const gid = Number((text.match(/\bgid\s*=\s*(\d+)/) || [])[1] || 0);
-    const token = (text.match(/\btoken\s*=\s*["']([^"']+)["']/) || [])[1] || "";
-    const showkey = (text.match(/\bshowkey\s*=\s*["']([^"']+)["']/) || [])[1] || "";
-    const startpage = Number((text.match(/\bstartpage\s*=\s*(\d+)/) || [])[1] || 0);
-    const startkey = (text.match(/\bstartkey\s*=\s*["']([^"']+)["']/) || [])[1] || "";
-    const apiUrl =
-      (text.match(/\bapi_url\s*=\s*["']([^"']+)["']/) || [])[1] ||
-      `${window.location.origin}/api.php`;
-    return { gid, token, showkey, startpage, startkey, apiUrl };
-  }
-
-  function parseGalleryTags(doc = document) {
-    const tags = {};
-    const rows = doc.querySelectorAll("#taglist tr");
-    for (const tr of rows) {
-      const catCell = tr.querySelector("td.tc");
-      if (!catCell) continue;
-      const cat = catCell.textContent.replace(/:/g, "").trim().toLowerCase();
-      const values = Array.from(tr.querySelectorAll("td div a")).map((a) =>
-        a.textContent.trim()
-      );
-      if (cat && values.length > 0) {
-        tags[cat] = values;
-      }
-    }
-    return tags;
-  }
-
-  function computeGalleryPagination(doc = document, currentUrl = window.location.href) {
-    const gpcText = doc.querySelector(".gpc")?.textContent || "";
-    let totalPages = 0;
-    let perPage = 0;
-
-    const rangeMatch = gpcText.match(/Showing\s+([\d,]+)\s*-\s*([\d,]+)\s+of\s+([\d,]+)\s+images/i);
-    if (rangeMatch) {
-      const startIdx = Number(rangeMatch[1].replace(/,/g, ""));
-      const endIdx = Number(rangeMatch[2].replace(/,/g, ""));
-      totalPages = Number(rangeMatch[3].replace(/,/g, ""));
-
-      let currentP = 0;
-      try {
-        currentP = Number(new URL(currentUrl, window.location.origin).searchParams.get("p") || 0);
-      } catch {
-        currentP = 0;
-      }
-
-      if (currentP > 0 && startIdx > 1) {
-        perPage = Math.round((startIdx - 1) / currentP);
-      } else {
-        perPage = endIdx - startIdx + 1;
-      }
-    } else {
-      const gpcMatch = gpcText.match(/of\s+([\d,]+)\s+images/i);
-      if (gpcMatch) {
-        totalPages = Number(gpcMatch[1].replace(/,/g, ""));
-      }
-    }
-
-    if (!totalPages) {
-      const gddCells = Array.from(doc.querySelectorAll("#gdd td.gdt2"));
-      for (const td of gddCells) {
-        const m = (td.textContent || "").match(/^([\d,]+)\s+pages/i);
-        if (m) {
-          totalPages = Number(m[1].replace(/,/g, ""));
-          break;
-        }
-      }
-    }
-
-    const thumbsCount = doc.querySelectorAll("#gdt a[href*='/s/']").length;
-    if (!perPage) {
-      perPage = thumbsCount || 20;
-    }
-
-    return {
-      totalPages: totalPages || thumbsCount || 1,
-      perPage: perPage || 20
-    };
-  }
-
-  function detectPageMetadata() {
-    const vars = parseInlineScripts(document);
-    const url = window.location.href;
-
-    if (isGalleryPage) {
-      const urlMatch = url.match(/\/g\/(\d+)\/([a-f0-9]+)/i);
-      const gid = vars.gid || (urlMatch ? Number(urlMatch[1]) : 0);
-      const token = vars.token || (urlMatch ? urlMatch[2] : "");
-
-      const rawTitle =
-        document.querySelector("#gn")?.textContent?.trim() ||
-        document.querySelector("#gj")?.textContent?.trim() ||
-        document.title.replace(/\s*-\s*(ExHentai\.org|E-Hentai Galleries).*$/i, "");
-      const jpTitle = document.querySelector("#gj")?.textContent?.trim() || "";
-
-      const { totalPages, perPage } = computeGalleryPagination(document, url);
-      const tags = parseGalleryTags(document);
-
-      return {
-        mode: "gallery",
-        gid,
-        token,
-        apiUrl: vars.apiUrl,
-        rawTitle,
-        jpTitle,
-        tags,
-        galleryUrl: `${window.location.origin}/g/${gid}/${token}/`,
-        title: sanitizeName(rawTitle),
-        totalPages,
-        startPage: 1,
-        perPage
-      };
-    } else {
-      const urlMatch = window.location.pathname.match(/\/s\/([a-f0-9]+)\/(\d+)-(\d+)/i);
-      const startkey = (urlMatch ? urlMatch[1] : "") || vars.startkey || "";
-      const gid = (urlMatch ? Number(urlMatch[2]) : 0) || vars.gid || 0;
-      const urlPage = urlMatch ? Number(urlMatch[3]) : 0;
-
-      const backHref = document.querySelector("#i5 a")?.getAttribute("href") || "";
-      const backMatch = backHref.match(/\/g\/(\d+)\/([a-f0-9]+)/i);
-      const token = vars.token || (backMatch ? backMatch[2] : "");
-
-      const rawTitle =
-        document.querySelector("#i1 h1")?.textContent?.trim() ||
-        document.querySelector("h1")?.textContent?.trim() ||
-        document.title.replace(/\s*-\s*(ExHentai\.org|E-Hentai Galleries).*$/i, "");
-
-      const snSpans = document.querySelectorAll(".sn div span");
-      const domCurrentPage = Number(snSpans[0]?.textContent || 0);
-      const domTotalPages = Number(snSpans[1]?.textContent || 0);
-
-      const currentPage = domCurrentPage || urlPage || vars.startpage || 1;
-      const totalPages = domTotalPages || currentPage || 1;
-
-      return {
-        mode: "reader",
-        gid,
-        token,
-        showkey: vars.showkey,
-        startkey,
-        apiUrl: vars.apiUrl,
-        rawTitle,
-        jpTitle: "",
-        tags: {},
-        galleryUrl: token ? `${window.location.origin}/g/${gid}/${token}/` : window.location.href,
-        title: sanitizeName(rawTitle),
-        totalPages,
-        startPage: currentPage,
-        perPage: 0
-      };
-    }
-  }
-
-  function decodeHtmlEntities(str) {
-    if (!str) return "";
-    return str.replace(/&amp;/g, "&");
-  }
-
-  function parseReaderFragments(i3Html, i6Html, i7Html = "", nHtml = "") {
-    const combinedBottom = `${i6Html || ""}\n${i7Html || ""}`;
-    const combinedNav = `${i3Html || ""}\n${nHtml || ""}`;
-
-    const srcMatch =
-      (i3Html || "").match(/id=["']img["'][^>]*src=["']([^"']+)["']/i) ||
-      (i3Html || "").match(/src=["']([^"']+)["'][^>]*id=["']img["']/i);
-    const imgUrl = srcMatch ? decodeHtmlEntities(srcMatch[1]) : "";
-
-    let nextMatch = (i3Html || "").match(/load_image\(\s*(\d+)\s*,\s*['"]([a-f0-9]+)['"]\s*\)/i);
-    if (!nextMatch && nHtml) {
-      const nextTagMatch =
-        nHtml.match(/id=["']next["'][^>]*onclick=["'][^"']*load_image\(\s*(\d+)\s*,\s*['"]([a-f0-9]+)['"]\s*\)/i) ||
-        nHtml.match(/onclick=["'][^"']*load_image\(\s*(\d+)\s*,\s*['"]([a-f0-9]+)['"]\s*\)[^"']*["'][^>]*id=["']next["']/i);
-      if (nextTagMatch) nextMatch = nextTagMatch;
-    }
-    const nextPage = nextMatch ? Number(nextMatch[1]) : null;
-    const nextImgKey = nextMatch ? nextMatch[2] : null;
-
-    const nlMatch =
-      combinedNav.match(/nl\(\s*['"]([^'"]+)['"]\s*\)/i) ||
-      combinedBottom.match(/nl\(\s*['"]([^'"]+)['"]\s*\)/i);
-    const nlToken = nlMatch ? nlMatch[1] : null;
-
-    const fullMatch = combinedBottom.match(/href=["']([^"']*fullimg[^"']+)["']/i);
-    let fullImgUrl = fullMatch ? decodeHtmlEntities(fullMatch[1]) : "";
-    if (fullImgUrl && !/^https?:\/\//i.test(fullImgUrl)) {
-      try {
-        fullImgUrl = new URL(fullImgUrl, window.location.origin).href;
-      } catch {
-        // ignore
-      }
-    }
-
-    return { imgUrl, fullImgUrl, nextPage, nextImgKey, nlToken };
-  }
-
-  function parseFullReaderDocument(htmlText) {
-    const parser = new DOMParser();
-    const doc = parser.parseFromString(htmlText, "text/html");
-    const vars = parseInlineScripts(doc);
-
-    if (!vars.showkey) {
-      const skMatch = htmlText.match(/\bshowkey\s*=\s*["']([^"']+)["']/i);
-      if (skMatch) vars.showkey = skMatch[1];
-    }
-
-    const i3Html = doc.querySelector("#i3")?.innerHTML || "";
-    const i6Html = doc.querySelector("#i6")?.innerHTML || "";
-    const i7Html = doc.querySelector("#i7")?.innerHTML || "";
-    const i2Html = doc.querySelector("#i2")?.innerHTML || "";
-    const parsed = parseReaderFragments(i3Html, i6Html, i7Html, i2Html);
-
-    if (!parsed.nextImgKey) {
-      const nextA = doc.querySelector("#next")?.getAttribute("onclick") || "";
-      const m = nextA.match(/load_image\(\s*(\d+)\s*,\s*['"]([a-f0-9]+)['"]\s*\)/i);
-      if (m) {
-        parsed.nextPage = Number(m[1]);
-        parsed.nextImgKey = m[2];
-      }
-    }
-    return { ...vars, ...parsed, i2Html };
-  }
-
-  function findReaderLinkInGalleryDoc(doc, gid, targetPage) {
-    const re = new RegExp(`/s/([a-f0-9]+)/${gid}-${targetPage}(?:\\b|$)`, "i");
-    const links = Array.from(doc.querySelectorAll("#gdt a[href*='/s/'], a[href*='/s/']"));
-    for (const a of links) {
-      const href = a.getAttribute("href") || a.href || "";
-      if (re.test(href)) {
-        return new URL(href, window.location.origin).href;
-      }
-    }
-    return null;
-  }
 
   async function resolveReaderUrlForPage(targetPage, meta) {
     if (isReaderPage) {
@@ -843,7 +517,7 @@
     let perPage = meta.perPage || 0;
     if (!perPage) {
       const p0Url = `${window.location.origin}${baseGalleryPath}?p=0`;
-      const p0Res = await fetch(p0Url, { credentials: "include" });
+      const p0Res = await fetchWithTimeout(p0Url, { credentials: "include" });
       if (!p0Res.ok) throw new Error(`Не удалось загрузить галерею ?p=0 (HTTP ${p0Res.status})`);
       const p0Html = await p0Res.text();
       const p0Doc = new DOMParser().parseFromString(p0Html, "text/html");
@@ -865,7 +539,7 @@
 
     const pageIndex = Math.floor((targetPage - 1) / perPage);
     const galleryUrl = `${window.location.origin}${baseGalleryPath}?p=${pageIndex}`;
-    const res = await fetch(galleryUrl, { credentials: "include" });
+    const res = await fetchWithTimeout(galleryUrl, { credentials: "include" });
     if (!res.ok) throw new Error(`Не удалось загрузить лист галереи ?p=${pageIndex}`);
     const html = await res.text();
     const doc = new DOMParser().parseFromString(html, "text/html");
@@ -875,40 +549,56 @@
     throw new Error(`Не найдена ссылка на страницу #${targetPage} на листе галереи ?p=${pageIndex}`);
   }
 
-  function extractOriginalBaseName(url, contentType, fallbackIndex) {
-    let extFromMime = "";
-    if (contentType) {
-      if (contentType.includes("webp")) extFromMime = "webp";
-      else if (contentType.includes("jpeg") || contentType.includes("jpg")) extFromMime = "jpg";
-      else if (contentType.includes("png")) extFromMime = "png";
-      else if (contentType.includes("gif")) extFromMime = "gif";
-    }
-    try {
-      const clean = (url || "").split("?")[0].split(";")[0];
-      const last = decodeURIComponent(clean.substring(clean.lastIndexOf("/") + 1));
-      if (!last || last === "fullimg.php" || last === "fullimg") {
-        return { stem: `page_${fallbackIndex}`, ext: extFromMime || "jpg" };
+  async function fetchShowPageWithRetry(apiUrl, payload, updateStatus) {
+    let lastErr = null;
+    for (let attempt = 0; attempt <= API_MAX_RETRIES; attempt++) {
+      if (state.cancelled || instanceAborted) {
+        throw new Error("Загрузка отменена пользователем");
       }
-      const dot = last.lastIndexOf(".");
-      const stem = dot > 0 ? last.substring(0, dot) : last;
-      let ext = dot > 0 ? last.substring(dot + 1).toLowerCase() : (extFromMime || "webp");
-      if (ext === "wbp") ext = "webp";
-      if (!["webp", "jpg", "jpeg", "png", "gif", "bmp", "avif"].includes(ext)) {
-        ext = extFromMime || "webp";
-      }
-      return { stem: sanitizeName(stem || `page_${fallbackIndex}`, 60), ext };
-    } catch {
-      return { stem: `page_${fallbackIndex}`, ext: extFromMime || "webp" };
-    }
-  }
+      try {
+        const apiRes = await fetchWithTimeout(
+          apiUrl,
+          {
+            method: "POST",
+            credentials: "include",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+          },
+          NETWORK_TIMEOUT_MS
+        );
 
-  function formatEntryName(pageNumber, totalPages, origStem, ext, template) {
-    const padWidth = Math.max(3, String(totalPages).length);
-    const pagePad = String(pageNumber).padStart(padWidth, "0");
-    if (template === "{page_pad}") {
-      return `${pagePad}.${ext}`;
+        if (!apiRes.ok) {
+          const retryable = apiRes.status === 429 || apiRes.status >= 500;
+          if (retryable && attempt < API_MAX_RETRIES) {
+            updateStatus(
+              `API ответил HTTP ${apiRes.status} на стр. ${payload.page}. Повтор (${attempt + 1}/${API_MAX_RETRIES})...`
+            );
+            await sleep(1600 + attempt * 900);
+            continue;
+          }
+          throw new Error(`Ошибка ответа API на странице ${payload.page}: HTTP ${apiRes.status}`);
+        }
+
+        const data = await apiRes.json();
+        if (data.error) {
+          throw new Error(`API вернул ошибку: ${data.error}`);
+        }
+        return data;
+      } catch (err) {
+        lastErr = err;
+        if (state.cancelled || instanceAborted) {
+          throw new Error("Загрузка отменена пользователем");
+        }
+        if (attempt < API_MAX_RETRIES) {
+          updateStatus(
+            `Сбой сети API на стр. ${payload.page} (${err?.message || "ошибка"}). Повтор (${attempt + 1}/${API_MAX_RETRIES})...`
+          );
+          await sleep(1600 + attempt * 900);
+          continue;
+        }
+      }
     }
-    return `${pagePad}_${origStem}.${ext}`;
+    throw lastErr || new Error(`Не удалось получить страницу ${payload.page} от API`);
   }
 
   async function fetchPageWithRetry({
@@ -924,6 +614,10 @@
     let forceCompressedFallback = false;
 
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      if (state.cancelled || instanceAborted) {
+        throw new Error("Загрузка отменена пользователем");
+      }
+
       const useOriginal = Boolean(
         !forceCompressedFallback && settings.quality === "original" && info.fullImgUrl
       );
@@ -940,7 +634,12 @@
       });
 
       if (resp && resp.ok && resp.base64) {
-        return { resp, usedUrl: resp.finalUrl || targetUrl, info, usedFallback: forceCompressedFallback };
+        return {
+          resp,
+          usedUrl: resp.finalUrl || targetUrl,
+          info,
+          usedFallback: forceCompressedFallback
+        };
       }
 
       if (useOriginal && info.imgUrl && settings.fallbackOriginal !== false) {
@@ -957,22 +656,26 @@
           `Сбой узла на стр. ${pageNumber} (${resp?.error || "ошибка"}). Смена зеркала nl (${attempt + 1}/${maxRetries})...`
         );
         await sleep(900 + Math.floor(Math.random() * 300));
-        const fallbackReaderUrl = `${window.location.origin}/s/${imgKey}/${gid}-${pageNumber}?nl=${encodeURIComponent(info.nlToken)}`;
-        const nlRes = await fetch(fallbackReaderUrl, { credentials: "include" });
-        if (nlRes.ok) {
-          const nlHtml = await nlRes.text();
-          const refreshed = parseFullReaderDocument(nlHtml);
-          if (refreshed.imgUrl) {
-            info = {
-              ...info,
-              imgUrl: refreshed.imgUrl,
-              fullImgUrl: refreshed.fullImgUrl || info.fullImgUrl,
-              nlToken: refreshed.nlToken || info.nlToken,
-              nextPage: refreshed.nextPage || info.nextPage,
-              nextImgKey: refreshed.nextImgKey || info.nextImgKey
-            };
-            continue;
+        try {
+          const fallbackReaderUrl = `${window.location.origin}/s/${imgKey}/${gid}-${pageNumber}?nl=${encodeURIComponent(info.nlToken)}`;
+          const nlRes = await fetchWithTimeout(fallbackReaderUrl, { credentials: "include" });
+          if (nlRes.ok) {
+            const nlHtml = await nlRes.text();
+            const refreshed = parseFullReaderDocument(nlHtml);
+            if (refreshed.imgUrl) {
+              info = {
+                ...info,
+                imgUrl: refreshed.imgUrl,
+                fullImgUrl: refreshed.fullImgUrl || info.fullImgUrl,
+                nlToken: refreshed.nlToken || info.nlToken,
+                nextPage: refreshed.nextPage || info.nextPage,
+                nextImgKey: refreshed.nextImgKey || info.nextImgKey
+              };
+              continue;
+            }
           }
+        } catch {
+          // Сбой при запросе nl — попробуем следующую попытку
         }
       } else if (attempt < maxRetries) {
         updateStatus(`Повтор скачивания стр. ${pageNumber} (${attempt + 1}/${maxRetries})...`);
@@ -1008,7 +711,6 @@
     const rootName = activeRoot?.name ? sanitizeName(activeRoot.name, 95) : "";
     const isRootDownloadsItself = !rootName || /^(downloads|загрузки)$/i.test(rootName);
 
-    // Если выбрана базовая папка — записываем архив напрямую через File System Access API без окон «Сохранить как»
     if (activeRoot) {
       try {
         const perm = await activeRoot.queryPermission({ mode: "readwrite" });
@@ -1056,15 +758,11 @@
     return { savedInRootDir: false, dirName: "Загрузки" };
   }
 
-  // === ОТКРЫТИЕ ПАПКИ С МАНГОЙ В НАСТОЯЩЕМ ПРОВОДНИКЕ WINDOWS (`explorer.exe`) ===
-  // Никаких странных модальных окон «Выбор папки для сайта» — только настоящий Проводник Windows!
   async function handleOpenDownloadedFolder() {
     try {
       const meta = state.meta || detectPageMetadata();
       const cachedRecord = await getDownloadedGalleryRecord(meta.gid);
 
-      // 1. Если для этой манги уже есть проверенный downloadId в истории загрузок Chrome —
-      // сразу открываем её папку в настоящем Проводнике Windows!
       if (cachedRecord && typeof cachedRecord.explorerDownloadId === "number") {
         const showRes = await safeRuntimeMessage({
           action: "showDownloadIdInExplorer",
@@ -1075,9 +773,6 @@
         }
       }
 
-      // 2. Открываем системную папку загрузок в Проводнике Windows без создания временных загрузок и без окон «Сохранить как»
-
-      // 3. Фоллбэк: открываем последний скачанный файл или папку Загрузок в настоящем Проводнике Windows
       await safeRuntimeMessage({
         action: "openDownloadsFolder",
         preferShowLastFile: true
@@ -1277,8 +972,37 @@
     syncUI("Инициализация стартовой страницы...");
 
     const collectedFiles = [];
+    let collectedBytes = 0;
+    let savedPartCount = 0;
+    let totalPackedPages = 0;
     let lastCompletedPage = startPage - 1;
     let skippedCount = 0;
+
+    async function flushArchiveVolume(isFinalPart) {
+      if (collectedFiles.length === 0) return null;
+      const ext = settings.saveMode === "cbz" ? "cbz" : "zip";
+      const rangeSuffix =
+        startPage === 1 && endPage === meta.totalPages ? "" : `_p${startPage}-${endPage}`;
+      const partSuffix =
+        !isFinalPart || savedPartCount > 0 ? `_part${savedPartCount + 1}` : "";
+      const archiveName = `${meta.title}${rangeSuffix}${partSuffix}.${ext}`;
+
+      syncUI(
+        `Упаковка тома ${savedPartCount + 1} (${collectedFiles.length} стр.) в ${ext.toUpperCase()}...`
+      );
+      const saveRes = await saveArchiveToDisk(
+        collectedFiles,
+        meta,
+        settings,
+        archiveName,
+        rootHandle
+      );
+      totalPackedPages += collectedFiles.length;
+      savedPartCount += 1;
+      collectedFiles.length = 0;
+      collectedBytes = 0;
+      return { archiveName, saveRes };
+    }
 
     try {
       let gid = meta.gid;
@@ -1321,7 +1045,7 @@
             const keyMatch = readerUrl.match(/\/s\/([a-f0-9]+)\/(\d+)-(\d+)/i);
             if (keyMatch) currentImgKey = keyMatch[1];
 
-            const firstRes = await fetch(readerUrl, { credentials: "include" });
+            const firstRes = await fetchWithTimeout(readerUrl, { credentials: "include" });
             if (!firstRes.ok) throw new Error(`Ошибка загрузки страницы ридера #${page}`);
             const firstHtml = await firstRes.text();
             const parsedFirst = parseFullReaderDocument(firstHtml);
@@ -1354,9 +1078,7 @@
           settings.fileTemplate
         );
 
-        const bin = atob(resp.base64);
-        const bytes = new Uint8Array(bin.length);
-        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        const bytes = base64ToUint8Array(resp.base64);
 
         if (settings.saveMode === "folder" && targetMangaDirHandle) {
           const fileHandle = await targetMangaDirHandle.getFileHandle(entryFileName, {
@@ -1366,7 +1088,12 @@
           await writable.write(bytes);
           await writable.close();
         } else {
+          // Если добавление файла превысит лимит тома (450 МБ) — сбрасываем текущий том на диск, чтобы избежать OOM
+          if (collectedFiles.length > 0 && collectedBytes + bytes.length > MAX_ARCHIVE_PART_BYTES) {
+            await flushArchiveVolume(false);
+          }
           collectedFiles.push({ name: entryFileName, data: bytes });
+          collectedBytes += bytes.length;
         }
 
         state.current = stepIndex;
@@ -1409,26 +1136,17 @@
         await sleep(remainingWait);
 
         lastApiCallTs = performance.now();
-        const apiRes = await fetch(apiUrl, {
-          method: "POST",
-          credentials: "include",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
+        const data = await fetchShowPageWithRetry(
+          apiUrl,
+          {
             method: "showpage",
             gid: Number(gid),
             page: Number(nextPage),
             imgkey: nextImgKey,
             showkey
-          })
-        });
-
-        if (!apiRes.ok) {
-          throw new Error(`Ошибка ответа API на странице ${nextPage}: HTTP ${apiRes.status}`);
-        }
-        const data = await apiRes.json();
-        if (data.error) {
-          throw new Error(`API вернул ошибку: ${data.error}`);
-        }
+          },
+          (txt) => syncUI(txt)
+        );
 
         currentImgKey = nextImgKey;
         currentInfo = parseReaderFragments(
@@ -1440,38 +1158,27 @@
       }
 
       if (settings.saveMode === "cbz" || settings.saveMode === "zip") {
-        if (collectedFiles.length > 0) {
-          const ext = settings.saveMode === "cbz" ? "cbz" : "zip";
-          const rangeSuffix =
-            startPage === 1 && endPage === meta.totalPages ? "" : `_p${startPage}-${endPage}`;
-          const archiveName = `${meta.title}${rangeSuffix}.${ext}`;
-
-          syncUI(
-            `Упаковка ${collectedFiles.length} страниц в единый ${ext.toUpperCase()}-архив...`
-          );
-          const saveRes = await saveArchiveToDisk(
-            collectedFiles,
-            meta,
-            settings,
-            archiveName,
-            rootHandle
-          );
+        const finalFlush = await flushArchiveVolume(true);
+        if (finalFlush || savedPartCount > 0) {
+          const lastArchiveName = finalFlush ? finalFlush.archiveName : `${meta.title}.${settings.saveMode}`;
+          const lastSaveRes = finalFlush ? finalFlush.saveRes : { savedInRootDir: false, dirName: "Загрузки" };
           state.existingStatus = "complete_archive";
-          state.existingCount = collectedFiles.length;
+          state.existingCount = totalPackedPages;
           await saveDownloadedGalleryRecord(meta.gid, {
             title: meta.title,
-            archiveName,
-            pagesCount: collectedFiles.length,
+            archiveName: lastArchiveName,
+            pagesCount: totalPackedPages,
             totalPages: meta.totalPages,
             complete: startPage === 1 && endPage === meta.totalPages
           });
           applyExistingBadgeUI();
 
-          const whereText = saveRes.savedInRootDir
-            ? `в папку "${saveRes.dirName}/${archiveName}"`
-            : `как "${archiveName}"`;
+          const whereText = lastSaveRes.savedInRootDir
+            ? `в папку "${lastSaveRes.dirName}/${lastArchiveName}"`
+            : `как "${lastArchiveName}"`;
+          const partsNote = savedPartCount > 1 ? ` (разбито на ${savedPartCount} тома)` : "";
           syncUI(
-            `✅ Архив сохранён ${whereText} (${collectedFiles.length} стр.)! Нажмите «📂 Открыть папку».`
+            `✅ Архив сохранён ${whereText}${partsNote} (${totalPackedPages} стр.)! Нажмите «📂 Открыть папку».`
           );
         }
       } else {
@@ -1616,6 +1323,9 @@
     }
 
     const meta = detectPageMetadata();
+    if (!meta.gid || (!document.querySelector("#gdt") && !document.querySelector("#i3"))) {
+      return;
+    }
     state.meta = meta;
 
     let s = {};
@@ -1641,7 +1351,7 @@
     panel.innerHTML = `
       <div class="mhs-header">
         <div class="mhs-title">
-          <span>ExManga Harvester v1.9</span>
+          <span>ExManga Harvester v2.0</span>
           <span class="mhs-badge" id="mhs-badge-meta"></span>
           <span class="mhs-badge" id="mhs-badge-existing" style="display:none;"></span>
         </div>
@@ -1767,7 +1477,9 @@
         state.rootDirHandle = handle;
         state.folderPermission = "granted";
         updateFolderBtnLabel(handle.name, "granted");
-        await refreshExistingStatusOnPanel(s.folderTemplate || "{title}");
+        const curSettingsRes = await safeStorageGet(["harvesterSettings"]);
+        const tpl = curSettingsRes?.harvesterSettings?.folderTemplate || "{title}";
+        await refreshExistingStatusOnPanel(tpl);
         if (state.existingStatus === "none") {
           syncUI(`Базовая папка активна: "${handle.name}". Внутри неё создаётся "${meta.title}".`);
         }
@@ -1835,6 +1547,25 @@
       }
     }
   }
+
+  const onStorageChanged = (changes, areaName) => {
+    if (instanceAborted || areaName !== "local" || !changes.harvesterSettings || !uiEls) return;
+    const ns = changes.harvesterSettings.newValue || {};
+    if (ns.saveMode) {
+      const normalized = ns.saveMode === "picker" ? "folder" : ns.saveMode;
+      if (uiEls.modeSelect && uiEls.modeSelect.value !== normalized) {
+        uiEls.modeSelect.value = normalized;
+      }
+    }
+    if (ns.quality && uiEls.qualitySelect && uiEls.qualitySelect.value !== ns.quality) {
+      uiEls.qualitySelect.value = ns.quality === "original" ? "original" : "webp";
+    }
+    if (ns.folderTemplate && state.meta && uiEls.folderPreview) {
+      const previewSubfolder = buildFolderPath(ns.folderTemplate, state.meta.gid, state.meta.title);
+      uiEls.folderPreview.textContent = `Папка манги: ${previewSubfolder}`;
+      uiEls.folderPreview.title = previewSubfolder;
+    }
+  };
 
   const onRuntimeMessage = (msg, sender, sendResponse) => {
     if (instanceAborted || !msg || !msg.action) return false;
@@ -1921,6 +1652,7 @@
 
   if (isExtensionContextValid()) {
     chrome.runtime.onMessage.addListener(onRuntimeMessage);
+    chrome.storage.onChanged.addListener(onStorageChanged);
   }
 
   window.addEventListener(
@@ -1935,6 +1667,7 @@
       try {
         if (isExtensionContextValid()) {
           chrome.runtime.onMessage.removeListener(onRuntimeMessage);
+          chrome.storage.onChanged.removeListener(onStorageChanged);
         }
       } catch {
         // ignore

@@ -1,15 +1,15 @@
-// ExManga Harvester Studio v1.9 — Фоновый сервис (Manifest V3 Service Worker)
+// ExManga Harvester Studio v2.0 — Фоновый сервис (Manifest V3 Service Worker)
 
 const DEFAULT_SETTINGS = {
-  saveMode: "folder",                   // "folder" | "cbz" | "zip"
-  quality: "webp",                      // "webp" | "original"
-  delayMs: 1200,                        // Целевой интервал между запросами к API (мс)
-  maxRetries: 3,                        // Попытки смены зеркала через ?nl=...
-  folderTemplate: "{title}",            // "{title}" | "[{gid}] {title}" | "Manga/{title}"
+  saveMode: "folder",                     // "folder" | "cbz" | "zip"
+  quality: "webp",                        // "webp" | "original"
+  delayMs: 1200,                          // Целевой интервал между запросами к API (мс)
+  maxRetries: 3,                          // Попытки смены зеркала через ?nl=...
+  folderTemplate: "{title}",              // "{title}" | "[{gid}] {title}" | "Manga/{title}"
   fileTemplate: "{page_pad}_{orig_name}", // "{page_pad}" | "{page_pad}_{orig_name}"
-  smartResume: true,                    // Пропускать уже скачанные файлы в папке
-  includeComicInfo: true,               // Добавлять ComicInfo.xml с метаданными и тегами
-  fallbackOriginal: true                // Авто-фоллбэк на WebP при лимите GP/509 у fullimg
+  smartResume: true,                      // Пропускать уже скачанные файлы в папке
+  includeComicInfo: true,                 // Добавлять ComicInfo.xml с метаданными и тегами
+  fallbackOriginal: true                  // Авто-фоллбэк на WebP при лимите GP/509 у fullimg
 };
 
 const TARGET_URL_PATTERNS = [
@@ -23,10 +23,32 @@ const TARGET_URL_PATTERNS = [
   "*://*.e-hentai.org/s/*"
 ];
 
+const TRUSTED_CREDENTIAL_HOST_RE = /(^|\.)(exhentai|e-hentai)\.org$/i;
+const IMAGE_FETCH_TIMEOUT_MS = 25000;
+
+function isAllowedHttpUrl(rawUrl) {
+  try {
+    const parsed = new URL(String(rawUrl || ""));
+    return parsed.protocol === "https:" || parsed.protocol === "http:";
+  } catch {
+    return false;
+  }
+}
+
+function canSendCredentialsTo(rawUrl) {
+  try {
+    const parsed = new URL(String(rawUrl || ""));
+    return TRUSTED_CREDENTIAL_HOST_RE.test(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
 function sanitizeDownloadRelativePath(rawPath) {
   return String(rawPath || "Manga/ComicInfo.xml")
     .replace(/\\/g, "/")
     .split("/")
+    .filter((part) => part && part !== "." && part !== "..")
     .map((part, idx, arr) => {
       const isLast = idx === arr.length - 1;
       let clean = part
@@ -76,9 +98,7 @@ async function setLastDownloadId(downloadId) {
   }
 }
 
-// Скачивание небольшого файла/архива через chrome.downloads с ожиданием завершения записи на диск,
-// чтобы вызов chrome.downloads.show(downloadId) гарантированно открывал именно эту подпапку в Проводнике Windows
-function downloadUrlAndWait(url, rawFilename, conflictAction = "overwrite", timeoutMs = 4500) {
+function downloadUrlAndWait(url, rawFilename, conflictAction = "overwrite", timeoutMs = 60000) {
   const filename = sanitizeDownloadRelativePath(rawFilename);
   return new Promise((resolve) => {
     chrome.downloads.download(
@@ -135,20 +155,6 @@ function downloadUrlAndWait(url, rawFilename, conflictAction = "overwrite", time
   });
 }
 
-function cleanupProbeDownload(downloadId) {
-  if (typeof downloadId !== "number") return;
-  try {
-    chrome.downloads.removeFile(downloadId, () => {
-      void chrome.runtime.lastError;
-      chrome.downloads.erase({ id: downloadId }, () => {
-        void chrome.runtime.lastError;
-      });
-    });
-  } catch {
-    // ignore
-  }
-}
-
 async function reinjectOpenGalleryTabs() {
   try {
     const tabs = await chrome.tabs.query({ url: TARGET_URL_PATTERNS });
@@ -161,7 +167,7 @@ async function reinjectOpenGalleryTabs() {
         });
         await chrome.scripting.executeScript({
           target: { tabId: tab.id },
-          files: ["content.js"]
+          files: ["zip_builder.js", "parser.js", "content.js"]
         });
       } catch {
         // Вкладка ещё грузится или недоступна
@@ -182,33 +188,40 @@ chrome.runtime.onInstalled.addListener(async () => {
   await reinjectOpenGalleryTabs();
 });
 
-async function fetchWithFallback(url, includeCreds) {
+async function fetchOnceWithTimeout(url, credentialsMode, timeoutMs = IMAGE_FETCH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetch(url, {
+    return await fetch(url, {
       method: "GET",
-      credentials: includeCreds ? "include" : "omit",
+      credentials: credentialsMode,
       cache: "no-store",
-      redirect: "follow"
+      redirect: "follow",
+      signal: controller.signal
     });
+  } catch (err) {
+    if (err && err.name === "AbortError") {
+      throw new Error(`Таймаут загрузки изображения (${Math.round(timeoutMs / 1000)} с)`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchWithFallback(url, includeCreds) {
+  const allowCreds = Boolean(includeCreds && canSendCredentialsTo(url));
+  try {
+    const res = await fetchOnceWithTimeout(url, allowCreds ? "include" : "omit");
     if (res.ok) return res;
-    if (includeCreds) {
-      const retryRes = await fetch(url, {
-        method: "GET",
-        credentials: "omit",
-        cache: "no-store",
-        redirect: "follow"
-      });
+    if (allowCreds) {
+      const retryRes = await fetchOnceWithTimeout(url, "omit");
       if (retryRes.ok) return retryRes;
     }
     throw new Error(`HTTP ${res.status}`);
   } catch (err) {
-    if (includeCreds) {
-      const retryRes = await fetch(url, {
-        method: "GET",
-        credentials: "omit",
-        cache: "no-store",
-        redirect: "follow"
-      });
+    if (allowCreds) {
+      const retryRes = await fetchOnceWithTimeout(url, "omit");
       if (retryRes.ok) return retryRes;
     }
     throw err;
@@ -219,20 +232,40 @@ function uint8ToBase64(bytes) {
   const chunk = 0x8000;
   const parts = [];
   for (let i = 0; i < bytes.length; i += chunk) {
-    parts.push(String.fromCharCode.apply(null, bytes.subarray(i, i + chunk)));
+    const slice = bytes.subarray(i, i + chunk);
+    let str = "";
+    for (let j = 0; j < slice.length; j++) {
+      str += String.fromCharCode(slice[j]);
+    }
+    parts.push(str);
   }
   return btoa(parts.join(""));
 }
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (!sender || sender.id !== chrome.runtime.id) return false;
   if (!msg || !msg.action) return false;
 
   if (msg.action === "fetchImageBytes") {
+    if (!isAllowedHttpUrl(msg.url)) {
+      sendResponse({
+        ok: false,
+        isQuotaOrLimit: false,
+        error: "Недопустимый URL изображения (разрешены только http/https)"
+      });
+      return false;
+    }
+
     const includeCreds = Boolean(msg.includeCredentials);
     fetchWithFallback(msg.url, includeCreds)
       .then(async (res) => {
         const contentType = (res.headers.get("content-type") || "").toLowerCase();
-        if (contentType.includes("text/html") || contentType.includes("text/plain")) {
+        const isBinaryImage =
+          !contentType ||
+          contentType.startsWith("image/") ||
+          contentType.includes("application/octet-stream");
+
+        if (!isBinaryImage) {
           const previewText = (await res.text()).slice(0, 600);
           const isQuotaOrLimit =
             /requires GP|bandwidth|limit|509|exceeded|insufficient|temporarily unavailable/i.test(
@@ -240,7 +273,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             );
           const reason = isQuotaOrLimit
             ? `Лимит сервера/GP для оригинала (${previewText.replace(/<[^>]+>/g, " ").trim().slice(0, 90)})`
-            : "Сервер вернул текст/HTML вместо изображения (сбой ноды H@H)";
+            : `Сервер вернул ${contentType.split(";")[0] || "не-изображение"} вместо картинки (сбой ноды H@H)`;
           sendResponse({
             ok: false,
             isQuotaOrLimit,
@@ -278,30 +311,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
-  // Запись якорного файла (например, ComicInfo.xml) в подпапку манги через chrome.downloads
-  // для получения системного downloadId, который открывает эту подпапку в настоящем Проводнике Windows
-  if (msg.action === "createAnchorDownload") {
-    (async () => {
-      const res = await downloadUrlAndWait(
-        msg.dataUrl,
-        msg.relativePath,
-        msg.conflictAction || "overwrite",
-        3500
-      );
-      if (res.ok && typeof res.downloadId === "number") {
-        await setLastDownloadId(res.downloadId);
-      }
-      sendResponse(res);
-    })();
-    return true;
-  }
-
-  if (msg.action === "removeProbeDownload") {
-    cleanupProbeDownload(msg.downloadId);
-    sendResponse({ ok: true });
-    return true;
-  }
-
   // Скачивание архива через chrome.downloads с точным запоминанием его downloadId
   if (msg.action === "downloadArchiveBlobUrl") {
     (async () => {
@@ -309,7 +318,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         msg.blobUrl,
         msg.filename || "Manga.cbz",
         "uniquify",
-        15000
+        60000
       );
       if (res.ok && typeof res.downloadId === "number") {
         await setLastDownloadId(res.downloadId);

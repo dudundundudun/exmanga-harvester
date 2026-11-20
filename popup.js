@@ -39,7 +39,10 @@ async function loadSettings() {
 }
 
 async function saveSettings() {
+  const existingRes = await chrome.storage.local.get(["harvesterSettings"]);
+  const existing = existingRes?.harvesterSettings || {};
   const settings = {
+    ...existing,
     saveMode: els.saveMode.value,
     folderTemplate: els.folderTemplate.value,
     quality: els.quality.value,
@@ -194,7 +197,12 @@ els.btnOpenFolder.addEventListener("click", () => {
   }
 });
 
+let pollTimer = null;
 loadSettings().then(() => {
   pollTabStatus();
-  setInterval(pollTabStatus, 800);
+  pollTimer = setInterval(pollTabStatus, 800);
+});
+
+window.addEventListener("unload", () => {
+  if (pollTimer) clearInterval(pollTimer);
 });
