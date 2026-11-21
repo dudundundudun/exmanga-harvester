@@ -1,14 +1,16 @@
 {
   "manifest_version": 3,
-  "name": "ExManga Harvester Studio (v2.0)",
+  "name": "ExManga Harvester Studio (v2.2)",
   "short_name": "ExManga Harvester",
-  "version": "2.0.0",
-  "description": "Автосохранение манги с ExHentai / E-Hentai напрямую в папку (Smart Resume, без окон «Сохранить как») или в CBZ/ZIP с ComicInfo.xml, таймаутами и защитой от обрывов.",
+  "version": "2.2.0",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2xdjHNhomto15RYA2Xo7SxhAVfALWUeP4RiE2mAkDyCir1+v/EuxvIp7pm5gVHYQJQ1CiIEmhAUqK1LHhnwVt2rdxH5xkKtkl3ykPvHiT/bqqjIcrs9urxKq2paU2WMOz8heLpAfSwi1bIiog/Iap99Dpv1abw7xl/YAsTA8YyzlObDtpNduM5ggTvOVUWMZLdHteTwzAskAAYePDPIpZG7PFAdh51QAzik0NsOBr94cplMbLkCqmFGhjy/du+kbk3X0oVXsNajY9TjGe5C1uQ1LZGFaC+LASttL4p5f5+EHWMRn8DlxE5+2e7y7tBrUp7FmMce1gSB9oY0pM5xGnQIDAQAB",
+  "description": "Автосохранение манги с ExHentai / E-Hentai напрямую в папку (Smart Resume, без окон «Сохранить как») или в CBZ/ZIP с ComicInfo.xml и автоопределением пути для Проводника Windows.",
   "permissions": [
     "downloads",
     "storage",
     "activeTab",
-    "scripting"
+    "scripting",
+    "nativeMessaging"
   ],
   "host_permissions": [
     "https://*/*",
@@ -18,7 +20,7 @@
     "service_worker": "background.js"
   },
   "action": {
-    "default_title": "ExManga Harvester Studio v2.0",
+    "default_title": "ExManga Harvester Studio v2.2",
     "default_popup": "popup.html",
     "default_icon": {
       "16": "icons/icon16.png",

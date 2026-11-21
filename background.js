@@ -1,4 +1,6 @@
-// ExManga Harvester Studio v2.0 — Фоновый сервис (Manifest V3 Service Worker)
+// ExManga Harvester Studio v2.2 — Фоновый сервис (Manifest V3 Service Worker)
+
+const NATIVE_HOST_NAME = "com.exmanga.harvester";
 
 const DEFAULT_SETTINGS = {
   saveMode: "folder",                     // "folder" | "cbz" | "zip"
@@ -7,6 +9,7 @@ const DEFAULT_SETTINGS = {
   maxRetries: 3,                          // Попытки смены зеркала через ?nl=...
   folderTemplate: "{title}",              // "{title}" | "[{gid}] {title}" | "Manga/{title}"
   fileTemplate: "{page_pad}_{orig_name}", // "{page_pad}" | "{page_pad}_{orig_name}"
+  baseFolderFullPath: "C:\\Users\\Alexey\\Pictures\\MANGA", // Полный путь к базовой папке для Проводника Windows
   smartResume: true,                      // Пропускать уже скачанные файлы в папке
   includeComicInfo: true,                 // Добавлять ComicInfo.xml с метаданными и тегами
   fallbackOriginal: true                  // Авто-фоллбэк на WebP при лимите GP/509 у fullimg
@@ -96,6 +99,24 @@ async function setLastDownloadId(downloadId) {
   } catch {
     // ignore storage errors
   }
+}
+
+function sendNativeHostRequest(payload) {
+  return new Promise((resolve) => {
+    if (!chrome.runtime || typeof chrome.runtime.sendNativeMessage !== "function") {
+      resolve({ ok: false, notInstalled: true, error: "nativeMessaging API недоступен" });
+      return;
+    }
+    chrome.runtime.sendNativeMessage(NATIVE_HOST_NAME, payload, (resp) => {
+      if (chrome.runtime.lastError) {
+        const msg = chrome.runtime.lastError.message || "Native host error";
+        const notInstalled = /not found|forbidden/i.test(msg);
+        resolve({ ok: false, notInstalled, error: msg });
+        return;
+      }
+      resolve(resp || { ok: false, error: "Пустой ответ помощника" });
+    });
+  });
 }
 
 function downloadUrlAndWait(url, rawFilename, conflictAction = "overwrite", timeoutMs = 60000) {
@@ -308,6 +329,72 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           error: err && err.message ? err.message : String(err)
         });
       });
+    return true;
+  }
+
+  // Открытие реальной папки манги в Проводнике Windows через Native Messaging
+  if (msg.action === "openPathInNativeExplorer") {
+    (async () => {
+      const stored = await chrome.storage.local.get(["harvesterSettings"]);
+      const baseDir =
+        (msg.baseDir || "").trim() ||
+        (stored?.harvesterSettings?.baseFolderFullPath || DEFAULT_SETTINGS.baseFolderFullPath);
+      const subPath = msg.subPath || "";
+      const nativeRes = await sendNativeHostRequest({
+        action: "openFolder",
+        baseDir: String(baseDir),
+        subPath: String(subPath)
+      });
+      sendResponse(nativeRes);
+    })();
+    return true;
+  }
+
+  // Автопоиск полного пути выбранной папки по временному файлу-маячку
+  if (msg.action === "locateFolderViaNative") {
+    (async () => {
+      const nativeRes = await sendNativeHostRequest({
+        action: "locateFolder",
+        folderName: String(msg.folderName || ""),
+        markerFile: String(msg.markerFile || "")
+      });
+      if (nativeRes && nativeRes.ok && nativeRes.path) {
+        const stored = await chrome.storage.local.get(["harvesterSettings"]);
+        await chrome.storage.local.set({
+          harvesterSettings: {
+            ...DEFAULT_SETTINGS,
+            ...(stored?.harvesterSettings || {}),
+            baseFolderFullPath: nativeRes.path
+          }
+        });
+      }
+      sendResponse(nativeRes);
+    })();
+    return true;
+  }
+
+  // Системный диалог выбора папки через помощника (кнопка «Обзор…» в Popup)
+  if (msg.action === "pickFolderViaNative") {
+    (async () => {
+      const stored = await chrome.storage.local.get(["harvesterSettings"]);
+      const initialDir =
+        (msg.initialDir || "").trim() ||
+        (stored?.harvesterSettings?.baseFolderFullPath || DEFAULT_SETTINGS.baseFolderFullPath);
+      const nativeRes = await sendNativeHostRequest({
+        action: "pickFolderDialog",
+        initialDir: String(initialDir)
+      });
+      if (nativeRes && nativeRes.ok && nativeRes.path) {
+        await chrome.storage.local.set({
+          harvesterSettings: {
+            ...DEFAULT_SETTINGS,
+            ...(stored?.harvesterSettings || {}),
+            baseFolderFullPath: nativeRes.path
+          }
+        });
+      }
+      sendResponse(nativeRes);
+    })();
     return true;
   }
 

@@ -6,6 +6,8 @@ const els = {
   endPage: document.getElementById("end-page"),
   saveMode: document.getElementById("save-mode"),
   folderTemplate: document.getElementById("folder-template"),
+  baseFolderFullPath: document.getElementById("base-folder-full-path"),
+  btnBrowseBasePath: document.getElementById("btn-browse-base-path"),
   quality: document.getElementById("quality"),
   fileTemplate: document.getElementById("file-template"),
   delayMs: document.getElementById("delay-ms"),
@@ -30,6 +32,9 @@ async function loadSettings() {
   const s = res.harvesterSettings || {};
   if (s.saveMode) els.saveMode.value = s.saveMode === "picker" ? "folder" : s.saveMode;
   if (s.folderTemplate) els.folderTemplate.value = s.folderTemplate;
+  if (els.baseFolderFullPath) {
+    els.baseFolderFullPath.value = s.baseFolderFullPath || "C:\\Users\\Alexey\\Pictures\\MANGA";
+  }
   if (s.quality) els.quality.value = s.quality;
   if (s.fileTemplate) els.fileTemplate.value = s.fileTemplate;
   if (s.delayMs) els.delayMs.value = s.delayMs;
@@ -45,6 +50,9 @@ async function saveSettings() {
     ...existing,
     saveMode: els.saveMode.value,
     folderTemplate: els.folderTemplate.value,
+    baseFolderFullPath: els.baseFolderFullPath
+      ? els.baseFolderFullPath.value.trim() || "C:\\Users\\Alexey\\Pictures\\MANGA"
+      : existing.baseFolderFullPath || "C:\\Users\\Alexey\\Pictures\\MANGA",
     quality: els.quality.value,
     fileTemplate: els.fileTemplate.value,
     delayMs: Math.max(1050, Number(els.delayMs.value || 1200)),
@@ -59,16 +67,38 @@ async function saveSettings() {
 for (const input of [
   els.saveMode,
   els.folderTemplate,
+  els.baseFolderFullPath,
   els.quality,
   els.fileTemplate,
   els.delayMs,
   els.maxRetries,
   els.smartResume,
   els.includeComicInfo
-]) {
+].filter(Boolean)) {
   input.addEventListener("change", () => {
     saveSettings();
     updatePermissionBanner();
+  });
+}
+
+if (els.btnBrowseBasePath) {
+  els.btnBrowseBasePath.addEventListener("click", () => {
+    els.btnBrowseBasePath.disabled = true;
+    chrome.runtime.sendMessage(
+      {
+        action: "pickFolderViaNative",
+        initialDir: els.baseFolderFullPath ? els.baseFolderFullPath.value : ""
+      },
+      (resp) => {
+        els.btnBrowseBasePath.disabled = false;
+        if (resp && resp.ok && resp.path && els.baseFolderFullPath) {
+          els.baseFolderFullPath.value = resp.path;
+          els.statusText.textContent = `Путь обновлён: ${resp.path}`;
+        } else if (resp && resp.notInstalled) {
+          els.statusText.textContent = "Запустите native_host\\install_explorer_helper.bat 1 раз";
+        }
+      }
+    );
   });
 }
 
@@ -184,15 +214,17 @@ els.btnCancel.addEventListener("click", () => {
   chrome.tabs.sendMessage(activeTabId, { action: "cancelFromPopup" }, () => pollTabStatus());
 });
 
-els.btnOpenFolder.addEventListener("click", () => {
+els.btnOpenFolder.addEventListener("click", async () => {
+  const settings = await saveSettings();
   if (activeTabId) {
     chrome.tabs.sendMessage(activeTabId, { action: "openFolderFromPopup" }, () => {
       window.close();
     });
   } else {
     chrome.runtime.sendMessage({
-      action: "openDownloadsFolder",
-      preferShowLastFile: els.saveMode.value === "cbz" || els.saveMode.value === "zip"
+      action: "openPathInNativeExplorer",
+      baseDir: settings.baseFolderFullPath,
+      subPath: ""
     });
   }
 });

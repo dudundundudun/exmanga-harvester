@@ -761,8 +761,24 @@
   async function handleOpenDownloadedFolder() {
     try {
       const meta = state.meta || detectPageMetadata();
-      const cachedRecord = await getDownloadedGalleryRecord(meta.gid);
+      const stored = await safeStorageGet(["harvesterSettings"]).catch(() => ({}));
+      const s = stored?.harvesterSettings || {};
+      const subPath =
+        state.lastMatchedSubpath ||
+        buildFolderPath(s.folderTemplate || "{title}", meta.gid, meta.title);
 
+      // 1. Сначала открываем реальную папку манги в Проводнике Windows через Native Messaging Helper
+      const nativeRes = await safeRuntimeMessage({
+        action: "openPathInNativeExplorer",
+        baseDir: s.baseFolderFullPath || "C:\\Users\\Alexey\\Pictures\\MANGA",
+        subPath: state.lastSaveMode === "folder" ? subPath : ""
+      });
+      if (nativeRes && nativeRes.ok) {
+        return;
+      }
+
+      // 2. Если был скачан архив через chrome.downloads — пробуем показать его
+      const cachedRecord = await getDownloadedGalleryRecord(meta.gid);
       if (cachedRecord && typeof cachedRecord.explorerDownloadId === "number") {
         const showRes = await safeRuntimeMessage({
           action: "showDownloadIdInExplorer",
@@ -771,6 +787,14 @@
         if (showRes && showRes.ok) {
           return;
         }
+      }
+
+      // 3. Понятная подсказка, если локальный помощник ещё не зарегистрирован
+      if (nativeRes && nativeRes.notInstalled) {
+        syncUI(
+          "Чтобы открывать папку MANGA напрямую в Проводнике, 1 раз запустите native_host\\install_explorer_helper.bat внутри папки расширения."
+        );
+        return;
       }
 
       await safeRuntimeMessage({
@@ -1351,7 +1375,7 @@
     panel.innerHTML = `
       <div class="mhs-header">
         <div class="mhs-title">
-          <span>ExManga Harvester v2.0</span>
+          <span>ExManga Harvester v2.2</span>
           <span class="mhs-badge" id="mhs-badge-meta"></span>
           <span class="mhs-badge" id="mhs-badge-existing" style="display:none;"></span>
         </div>
@@ -1469,6 +1493,38 @@
     uiEls.modeSelect.addEventListener("change", saveInlineSelects);
     uiEls.qualitySelect.addEventListener("change", saveInlineSelects);
 
+    async function autoResolveBaseFolderPath(dirHandle) {
+      if (!dirHandle || !dirHandle.name) return null;
+      const markerName = `.mhs_locate_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.tmp`;
+      let created = false;
+      try {
+        const fh = await dirHandle.getFileHandle(markerName, { create: true });
+        const w = await fh.createWritable();
+        await w.write("mhs");
+        await w.close();
+        created = true;
+        const res = await safeRuntimeMessage({
+          action: "locateFolderViaNative",
+          folderName: dirHandle.name,
+          markerFile: markerName
+        });
+        if (res && res.ok && res.path) {
+          return res.path;
+        }
+        return null;
+      } catch {
+        return null;
+      } finally {
+        if (created) {
+          try {
+            await dirHandle.removeEntry(markerName);
+          } catch {
+            // ignore cleanup error
+          }
+        }
+      }
+    }
+
     uiEls.pickDirBtn.addEventListener("click", async () => {
       try {
         const forceNew =
@@ -1477,11 +1533,18 @@
         state.rootDirHandle = handle;
         state.folderPermission = "granted";
         updateFolderBtnLabel(handle.name, "granted");
+
+        const resolvedFullPath = await autoResolveBaseFolderPath(handle);
+
         const curSettingsRes = await safeStorageGet(["harvesterSettings"]);
         const tpl = curSettingsRes?.harvesterSettings?.folderTemplate || "{title}";
         await refreshExistingStatusOnPanel(tpl);
         if (state.existingStatus === "none") {
-          syncUI(`Базовая папка активна: "${handle.name}". Внутри неё создаётся "${meta.title}".`);
+          if (resolvedFullPath) {
+            syncUI(`Базовая папка активна: "${resolvedFullPath}" (путь для Проводника определён автоматически).`);
+          } else {
+            syncUI(`Базовая папка активна: "${handle.name}". Внутри неё создаётся "${meta.title}".`);
+          }
         }
       } catch {
         // Пользователь закрыл окно выбора папки

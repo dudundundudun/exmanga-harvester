@@ -1,0 +1,9 @@
+{
+  "name": "com.exmanga.harvester",
+  "description": "ExManga Harvester Windows Explorer Helper",
+  "path": "C:\\Users\\Alexey\\Documents\\chrome_extentions\\exmanga_harvester_v1.8\\exmanga harvester\\native_host\\run_host.bat",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://fbfkbcpeggepocnefhialccafhmiggbe/"
+  ]
+}
